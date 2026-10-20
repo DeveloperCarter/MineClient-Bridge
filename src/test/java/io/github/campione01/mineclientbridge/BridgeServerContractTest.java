@@ -70,6 +70,13 @@ class BridgeServerContractTest {
         assertFalse(source.contains("mapping_unbound"));
         assertFalse(source.contains("createContext(\"/" + "chat\""));
 
+        // RPC work goes through Ixeris's queue or Minecraft's own and runs only after a render-thread check.
+        assertEquals(1, occurrences(source, "OptionalRenderDispatcher.dispatch("));
+        assertTrue(source.contains("result::completeExceptionally, mc::execute, mc::isSameThread,"));
+        assertTrue(source.contains("RenderSystem::isOnRenderThread);"));
+        assertTrue(source.contains("BridgeLog.LOGGER.info(\"MineClient Bridge RPC dispatch route: {}\", route)"));
+        assertFalse(source.contains("Minecraft.getInstance().execute("));
+
         String probe = Files.readString(project.resolve(
                 "src/main/java/io/github/campione01/mineclientbridge/InputEventProbe.java"));
         assertTrue(probe.contains("InputEvent.MouseButton.Pre.class"));

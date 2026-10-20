@@ -8,6 +8,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import com.mojang.blaze3d.platform.InputConstants;
 import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.systems.RenderSystem;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -34,6 +35,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.Screenshot;
@@ -84,6 +86,8 @@ public final class BridgeServer {
     private static final long MINECRAFT_TIMEOUT_SECONDS = 5;
     private static final long FRAME_TIMEOUT_SECONDS = 15;
     private static final AtomicInteger WORKER_SEQUENCE = new AtomicInteger();
+    private static final AtomicReference<OptionalRenderDispatcher.Route> LOGGED_DISPATCH_ROUTE =
+            new AtomicReference<>();
     private static final LinkedHashSet<InputConstants.Key> HELD_RAW_KEYS = new LinkedHashSet<>();
     private static final LinkedHashSet<Integer> HELD_WORLD_MOUSE_BUTTONS = new LinkedHashSet<>();
     private static volatile HttpServer server;
@@ -1535,8 +1539,9 @@ public final class BridgeServer {
     private static <T> T callOnMinecraftThread(Callable<T> operation, long timeoutSeconds)
             throws InterruptedException, ExecutionException, TimeoutException {
         CompletableFuture<T> result = new CompletableFuture<>();
+        Minecraft mc = Minecraft.getInstance();
         try {
-            Minecraft.getInstance().execute(() -> {
+            OptionalRenderDispatcher.Route route = OptionalRenderDispatcher.dispatch(() -> {
                 if (result.isDone()) {
                     return;
                 }
@@ -1547,7 +1552,16 @@ public final class BridgeServer {
                         result.completeExceptionally(error);
                     }
                 });
-            });
+            }, result::completeExceptionally, mc::execute, mc::isSameThread,
+                    RenderSystem::isOnRenderThread);
+            if (LOGGED_DISPATCH_ROUTE.getAndSet(route) != route) {
+                if (route == OptionalRenderDispatcher.Route.VANILLA_IXERIS_UNAVAILABLE) {
+                    BridgeLog.LOGGER.warn("MineClient Bridge RPC dispatch route: {} ({})", route,
+                            String.valueOf(OptionalRenderDispatcher.bindingFailure()));
+                } else {
+                    BridgeLog.LOGGER.info("MineClient Bridge RPC dispatch route: {}", route);
+                }
+            }
         } catch (RejectedExecutionException | IllegalStateException e) {
             result.completeExceptionally(e);
         }
