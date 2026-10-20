@@ -35,6 +35,8 @@ Use `kind: command` for explicit Minecraft commands. The command may include or 
 
 Key, raw-key and world-mouse replies carry `mod_input_event`, and `status` carries `mouse` and `mod_input_events`. `event_cancelled_by_mod: true` records that a mod consumed that input on purpose, which is a different outcome from input that was never delivered; do not report the first as a delivery failure. `event_fired: false` is not proof of the second either: a screen that consumes a key returns before Minecraft publishes the event, exactly as it does for a device. The screen-scope `mouse`, `look`, `text`, `command` and `release_all` routes drive no device handler and carry no `mod_input_event`.
 
+Bridge input enters Minecraft's own input handlers, not the window's GLFW device callbacks. A mod interface that reads only wrapped device callbacks may therefore not react to it; confirm with a frame and record such a screen as not operable through the bridge rather than as lost input.
+
 MCP observation is request/response, not a continuous video stream. Motion-dependent tests may request successive frames or retain a short client-owned framebuffer recording.
 
 ## Evidence Boundary

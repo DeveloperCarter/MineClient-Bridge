@@ -45,7 +45,7 @@ Any local program that receives the token can operate the exposed client actions
 ## Installation
 
 1. Install NeoForge for Minecraft 1.21.1.
-2. Place `mineclient-bridge-neoforge-1.21.1-1.1.6.jar` in the client's `mods` directory.
+2. Place `mineclient-bridge-neoforge-1.21.1-1.1.8.jar` in the client's `mods` directory.
 3. Start the client. The mod creates its config and token files on first launch.
 4. Connect an authorized loopback client to `http://127.0.0.1:38121` using the generated token.
 
@@ -54,9 +54,17 @@ The bridge is enabled by default. Set `"enabled": false` in `config/mineclient-b
 ## Background Input Isolation
 
 Version 1.1.3 virtualizes mouse capture/release, keyboard polling and clipboard
-access in isolated sessions. Physical keyboard and mouse callbacks are ignored
-there; authenticated Bridge input still runs through Minecraft's handlers.
-Normal foreground Minecraft sessions retain their native input behavior.
+access in isolated sessions. Minecraft's physical keyboard and mouse callbacks
+are not registered there; authenticated Bridge input still runs through
+Minecraft's handlers. Normal foreground Minecraft sessions retain their native
+input behavior.
+
+Since 1.1.8 the window's keyboard and mouse callback slots hold do-nothing
+placeholders in an isolated session instead of staying empty, so a mod that
+wraps the existing callbacks during startup, such as KotlinMCUI, no longer
+crashes the client. Physical input that reaches a placeholder is discarded.
+Bridge input does not pass through those callbacks either, so a mod interface
+that reads only the wrapped device callbacks does not see Bridge input.
 
 Version 1.1.5 also lets an isolated session grab the mouse without operating system
 focus. Minecraft refuses to continue an attack or to turn the player while the mouse is
@@ -80,7 +88,7 @@ the OS pointer must use a process-local path in their background integration.
 
 `GET /control/status`, `GET /control/capabilities`, `GET /control/frame`, `GET /control/keymaps`, `GET /control/state`, `GET /control/screen`, `POST /control/key`, `POST /control/raw-key`, `POST /control/look`, `POST /control/mouse`, `POST /control/text`, `POST /control/command`, `POST /control/release-all`, and `POST /control/close`.
 
-All Minecraft state reads and input changes are dispatched to the client main thread. A named mapping is driven through the handler its bound key would use, so `InputEvent.Key` and `InputEvent.MouseButton` are published and gameplay mods that read their controls from those events respond; like a real device, every mapping sharing that key reacts. Send `"exact": true` to activate only the requested `KeyMapping` instead, by borrowing an unused keyboard key for the length of one event; an unbound mapping always uses that route. A borrowed key cannot be held, and a mouse-bound mapping is refused while a screen is open, because the screen route would click whatever the pointer sits on rather than activate the mapping. World mouse buttons use Minecraft's native `MouseHandler` callback so NeoForge and gameplay-mod input events receive the same press/release sequence as a real client mouse; world scroll passes through NeoForge's mouse-scroll event before normal hotbar behavior. `POST /control/command` accepts up to 256 command characters with or without a leading slash. `POST /control/text` keeps normal chat-screen behavior, so submitted slash-prefixed text is handled as a command by Minecraft. Raw keys are delivered through Minecraft's own `KeyboardHandler`; the bridge never injects operating-system input. Raw-key and world-mouse `down` and `up` actions are idempotent. A `click` on a held input completes that press; otherwise it sends a new press/release pair, so every click ends released and repeated clicks remain independent. Release-all, close, and bridge shutdown emit native releases for every tracked raw key and world mouse button, including when a screen opened while a world button was held.
+All Minecraft state reads and input changes run on the client's render thread, through Ixeris's render queue when Ixeris is active and through Minecraft's own task queue otherwise. A named mapping is driven through the handler its bound key would use, so `InputEvent.Key` and `InputEvent.MouseButton` are published and gameplay mods that read their controls from those events respond; like a real device, every mapping sharing that key reacts. Send `"exact": true` to activate only the requested `KeyMapping` instead, by borrowing an unused keyboard key for the length of one event; an unbound mapping always uses that route. A borrowed key cannot be held, and a mouse-bound mapping is refused while a screen is open, because the screen route would click whatever the pointer sits on rather than activate the mapping. World mouse buttons use Minecraft's native `MouseHandler` callback so NeoForge and gameplay-mod input events receive the same press/release sequence as a real client mouse; world scroll passes through NeoForge's mouse-scroll event before normal hotbar behavior. `POST /control/command` accepts up to 256 command characters with or without a leading slash. `POST /control/text` keeps normal chat-screen behavior, so submitted slash-prefixed text is handled as a command by Minecraft. Raw keys are delivered through Minecraft's own `KeyboardHandler`; the bridge never injects operating-system input. Raw-key and world-mouse `down` and `up` actions are idempotent. A `click` on a held input completes that press; otherwise it sends a new press/release pair, so every click ends released and repeated clicks remain independent. Release-all, close, and bridge shutdown emit native releases for every tracked raw key and world mouse button, including when a screen opened while a world button was held.
 
 Every key, raw-key and world-mouse response carries `mod_input_event`, listing each event that dispatch published and whether a mod cancelled it, and `/control/status` reports `mouse` and `mod_input_events`. Together they separate a gameplay mod deliberately taking over a button from input that never arrived. `event_fired: false` is not by itself proof of the latter: Minecraft returns before publishing a key event when a screen consumes the key, exactly as it does for a physical keyboard. The screen-scope `mouse`, `look`, `text`, `command` and `release-all` routes do not drive a device handler and carry no `mod_input_event`.
 
@@ -103,7 +111,7 @@ This is a real 960x540 framebuffer from the NeoForge 1.21.1 smoke session. The g
 npm --prefix .\mcp test
 ```
 
-The release artifact is `build/libs/mineclient-bridge-neoforge-1.21.1-1.1.6.jar`.
+The release artifact is `build/libs/mineclient-bridge-neoforge-1.21.1-1.1.8.jar`.
 
 ## License And References
 
