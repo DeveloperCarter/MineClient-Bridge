@@ -6,7 +6,8 @@
   "client": [
     "InputConstantsMixin",
     "MouseHandlerMixin",
-    "KeyboardHandlerMixin"
+    "KeyboardHandlerMixin",
+    "WindowMixin"
   ],
   "injectors": {
     "defaultRequire": 1

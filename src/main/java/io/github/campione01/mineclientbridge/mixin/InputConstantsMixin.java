@@ -1,7 +1,9 @@
 package io.github.campione01.mineclientbridge.mixin;
 
 import com.mojang.blaze3d.platform.InputConstants;
+import com.mojang.blaze3d.systems.RenderSystem;
 import io.github.campione01.mineclientbridge.ClientInputIsolation;
+import io.github.campione01.mineclientbridge.IsolatedNativeCallbacks;
 import org.lwjgl.glfw.GLFWKeyCallbackI;
 import org.lwjgl.glfw.GLFWCharModsCallbackI;
 import org.lwjgl.glfw.GLFWCursorPosCallbackI;
@@ -19,15 +21,23 @@ public abstract class InputConstantsMixin {
     @Inject(method = "setupKeyboardCallbacks", at = @At("HEAD"), cancellable = true)
     private static void mineclientBridge$omitNativeKeyboardCallbacks(long window,
             GLFWKeyCallbackI key, GLFWCharModsCallbackI character, CallbackInfo callback) {
-        if (ClientInputIsolation.suppressNativeCallbackRegistration()) callback.cancel();
+        if (ClientInputIsolation.suppressNativeCallbackRegistration()) {
+            RenderSystem.assertOnRenderThreadOrInit();
+            IsolatedNativeCallbacks.ensureKeyboard(window);
+            callback.cancel();
+        }
     }
 
     @Inject(method = "setupMouseCallbacks", at = @At("HEAD"), cancellable = true)
     private static void mineclientBridge$omitNativeMouseCallbacks(long window,
             GLFWCursorPosCallbackI position, GLFWMouseButtonCallbackI button,
             GLFWScrollCallbackI scroll, GLFWDropCallbackI drop, CallbackInfo callback) {
-        // Reject hardware before it can enter a reentrant Minecraft task queue.
-        if (ClientInputIsolation.suppressNativeCallbackRegistration()) callback.cancel();
+        // Keep callback chaining valid without admitting hardware into Minecraft's task queue.
+        if (ClientInputIsolation.suppressNativeCallbackRegistration()) {
+            RenderSystem.assertOnRenderThreadOrInit();
+            IsolatedNativeCallbacks.ensureMouse(window);
+            callback.cancel();
+        }
     }
 
     @Inject(method = "grabOrReleaseMouse(JIDD)V", at = @At("HEAD"), cancellable = true)
