@@ -1108,6 +1108,7 @@ async function assertPreparedInputIsolationJar(modsRoot) {
 // Inspect ZIP metadata and the few capability entries without unpacking a mod directory.
 async function readJarDirectory(jar) {
   const size = (await jar.stat()).size;
+  if (!Number.isSafeInteger(size) || size < 22) throw new Error("Invalid ZIP file size");
   const tailOffset = Math.max(0, size - 65557);
   const tail = await readJarBytes(jar, tailOffset, size - tailOffset);
   let end = -1;
@@ -1119,12 +1120,58 @@ async function readJarDirectory(jar) {
     }
   }
   if (end < 0) throw new Error("ZIP end directory is missing");
-  const count = tail.readUInt16LE(end + 10);
-  const directorySize = tail.readUInt32LE(end + 12);
-  const directoryOffset = tail.readUInt32LE(end + 16);
-  if (tail.readUInt16LE(end + 4) !== 0 || tail.readUInt16LE(end + 6) !== 0 ||
-      tail.readUInt16LE(end + 8) !== count || count === 0xffff ||
-      directorySize > 16 * 1024 * 1024 || directoryOffset + directorySize > tailOffset + end) {
+  const diskCount = tail.readUInt16LE(end + 8);
+  let count = tail.readUInt16LE(end + 10);
+  let directorySize = tail.readUInt32LE(end + 12);
+  let directoryOffset = tail.readUInt32LE(end + 16);
+  const endOffset = tailOffset + end;
+  let directoryLimit = endOffset;
+  if (tail.readUInt16LE(end + 4) !== 0 || tail.readUInt16LE(end + 6) !== 0) {
+    throw new Error("Unsupported multi-disk ZIP directory");
+  }
+  const locator = endOffset >= 20 ? await readJarBytes(jar, endOffset - 20, 20) : null;
+  if (locator && locator.readUInt32LE(0) === 0x07064b50) {
+    const safe64 = (bytes, offset) => {
+      const value = bytes.readBigUInt64LE(offset);
+      if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error("Unsafe ZIP64 directory value");
+      return Number(value);
+    };
+    if (locator.readUInt32LE(4) !== 0 || locator.readUInt32LE(16) !== 1) {
+      throw new Error("Unsupported multi-disk ZIP64 locator");
+    }
+    const locatorOffset = endOffset - 20;
+    const recordOffset = safe64(locator, 8);
+    if (recordOffset > locatorOffset - 56) throw new Error("Invalid ZIP64 end record offset");
+    const record = await readJarBytes(jar, recordOffset, 56);
+    if (record.readUInt32LE(0) !== 0x06064b50) throw new Error("ZIP64 end record is missing");
+    const recordSize = safe64(record, 4);
+    if (recordSize < 44 || recordSize !== locatorOffset - recordOffset - 12) {
+      throw new Error("Invalid ZIP64 end record size");
+    }
+    if (record.readUInt32LE(16) !== 0 || record.readUInt32LE(20) !== 0) {
+      throw new Error("Unsupported multi-disk ZIP64 directory");
+    }
+    const zip64DiskCount = safe64(record, 24);
+    const zip64Count = safe64(record, 32);
+    const zip64Size = safe64(record, 40);
+    const zip64Offset = safe64(record, 48);
+    if (zip64DiskCount !== zip64Count ||
+        (diskCount !== 0xffff && diskCount !== zip64Count) ||
+        (count !== 0xffff && count !== zip64Count) ||
+        (directorySize !== 0xffffffff && directorySize !== zip64Size) ||
+        (directoryOffset !== 0xffffffff && directoryOffset !== zip64Offset)) {
+      throw new Error("ZIP64 and legacy directory metadata mismatch");
+    }
+    count = zip64Count;
+    directorySize = zip64Size;
+    directoryOffset = zip64Offset;
+    directoryLimit = recordOffset;
+  } else if (directorySize === 0xffffffff || directoryOffset === 0xffffffff || diskCount !== count) {
+    throw new Error("ZIP64 locator is missing or ZIP entry counts mismatch");
+  }
+  // A finite legacy directory can contain exactly 65535 entries without ZIP64 records.
+  if (directorySize > 16 * 1024 * 1024 || directoryOffset > directoryLimit ||
+      directorySize > directoryLimit - directoryOffset || count > Math.floor(directorySize / 46)) {
     throw new Error("Unsupported or invalid ZIP directory");
   }
   const directory = await readJarBytes(jar, directoryOffset, directorySize);
@@ -1137,6 +1184,7 @@ async function readJarDirectory(jar) {
     const nameLength = directory.readUInt16LE(offset + 28);
     const next = offset + 46 + nameLength + directory.readUInt16LE(offset + 30) + directory.readUInt16LE(offset + 32);
     if (next > directory.length) throw new Error("Truncated ZIP directory entry");
+    if (directory.readUInt16LE(offset + 34) !== 0) throw new Error("Unsupported multi-disk ZIP entry");
     const name = directory.toString("utf8", offset + 46, offset + 46 + nameLength);
     if (entries.has(name)) throw new Error("Duplicate ZIP entry");
     entries.set(name, {

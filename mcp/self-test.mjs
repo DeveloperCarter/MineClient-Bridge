@@ -2,14 +2,16 @@
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import vm from "node:vm";
 import { fileURLToPath } from "node:url";
-import { deflateRawSync } from "node:zlib";
+import { deflateRawSync, inflateRawSync } from "node:zlib";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_FILE = path.join(HERE, "mineclient-bridge-mcp.mjs");
@@ -31,11 +33,14 @@ let lastClientStderr = "";
 
 if (process.argv[2] === "--fixture-bridge") {
   await runFixtureBridge(process.argv[3]);
+} else if (process.argv[2] === "--zip64-directory-only") {
+  await runZip64DirectoryTests();
 } else {
   await runSelfTest();
 }
 
 async function runSelfTest() {
+  await runZip64DirectoryTests();
   const suffix = `${process.pid}-${Date.now().toString(36)}`;
   const namespace = `self-test-${suffix}`;
   const launchRun = `mineclient-launch-${suffix}`;
@@ -626,6 +631,275 @@ async function runSelfTest() {
     }
     await safeRemoveTree(stateRoot, HERE, "self-test-");
   }
+}
+
+async function runZip64DirectoryTests() {
+  const sourceBytes = await fs.readFile(SERVER_FILE);
+  const source = sourceBytes.toString("utf8");
+  const sourceSha256 = createHash("sha256").update(sourceBytes).digest("hex");
+  const helperNames = [
+    "assertPreparedInputIsolationJar", "readJarDirectory", "readJarEntry", "readJarBytes",
+    "assertNormalDirectory", "assertNormalFile", "sameWindowsPath", "stripExtendedPrefix", "isPlainObject"
+  ];
+  const helperText = helperNames.map((name) => {
+    const definitions = [...source.matchAll(new RegExp(`^(?:async )?function ${name}\\(`, "gm"))];
+    assert.equal(definitions.length, 1, `Expected exactly one server helper ${name}`);
+    const rest = source.slice(definitions[0].index);
+    const next = rest.slice(1).search(/\n(?:async )?function [A-Za-z0-9_]+\(/);
+    assert(next >= 0, `Missing boundary after server helper ${name}`);
+    return rest.slice(0, next + 1);
+  }).join("\n");
+  const constantText = ["BRIDGE_CLASS_ROOT", "ISOLATION_MIXINS", "ISOLATION_MIXIN_CONFIG"].map((name) => {
+    const definitions = [...source.matchAll(new RegExp(`^const ${name} = .*;\\r?$`, "gm"))];
+    assert.equal(definitions.length, 1, `Expected exactly one server constant ${name}`);
+    return definitions[0][0];
+  }).join("\n");
+
+  // Compile trusted source helpers only; do not import the server or touch a live mod directory.
+  const script = new vm.Script(`${constantText}\n${helperText}\n` +
+    "const entryRead = readJarEntry;\n" +
+    "readJarEntry = async (...args) => { observeEntry(args[2]); return entryRead(...args); };\n" +
+    "({ readJarDirectory, assertPreparedInputIsolationJar })", { filename: SERVER_FILE });
+  function load(filesystem = {}, observeEntry = () => {}) {
+    return script.runInNewContext({ fs: filesystem, path, Buffer, inflateRawSync, observeEntry }, { timeout: 1000 });
+  }
+  const current = load();
+  const cases = [];
+  async function check(name, body) {
+    try {
+      await body();
+    } catch (error) {
+      throw new Error(`ZIP64 case failed: ${name}`, { cause: error });
+    }
+    cases.push(name);
+  }
+  function memoryJar(bytes) {
+    return {
+      async stat() { return { size: bytes.length }; },
+      async read(target, targetOffset, length, position) {
+        const count = Math.max(0, Math.min(length, bytes.length - position));
+        bytes.copy(target, targetOffset, position, position + count);
+        return { bytesRead: count };
+      },
+      async close() {}
+    };
+  }
+  function metadataZip(count, { zip64 = false, countOnly = false, comment = 0, extended = 0 } = {}) {
+    const prefix = Buffer.alloc(8);
+    const directory = Buffer.concat(Array.from({ length: count }, (_, index) => {
+      const name = Buffer.from(`entry-${String(index).padStart(6, "0")}`);
+      const header = Buffer.alloc(46);
+      header.writeUInt32LE(0x02014b50);
+      header.writeUInt16LE(name.length, 28);
+      return Buffer.concat([header, name]);
+    }));
+    const directoryOffset = prefix.length;
+    const recordOffset = directoryOffset + directory.length;
+    const record = Buffer.alloc(zip64 ? 56 + extended : 0);
+    const locator = Buffer.alloc(zip64 ? 20 : 0);
+    if (zip64) {
+      record.writeUInt32LE(0x06064b50);
+      record.writeBigUInt64LE(BigInt(44 + extended), 4);
+      record.writeUInt16LE(45, 12);
+      record.writeUInt16LE(45, 14);
+      record.writeBigUInt64LE(BigInt(count), 24);
+      record.writeBigUInt64LE(BigInt(count), 32);
+      record.writeBigUInt64LE(BigInt(directory.length), 40);
+      record.writeBigUInt64LE(BigInt(directoryOffset), 48);
+      locator.writeUInt32LE(0x07064b50);
+      locator.writeBigUInt64LE(BigInt(recordOffset), 8);
+      locator.writeUInt32LE(1, 16);
+    }
+    const end = Buffer.alloc(22 + comment);
+    end.writeUInt32LE(0x06054b50);
+    end.writeUInt16LE(zip64 ? 0xffff : count, 8);
+    end.writeUInt16LE(zip64 ? 0xffff : count, 10);
+    end.writeUInt32LE(zip64 && !countOnly ? 0xffffffff : directory.length, 12);
+    end.writeUInt32LE(zip64 && !countOnly ? 0xffffffff : directoryOffset, 16);
+    end.writeUInt16LE(comment, 20);
+    return {
+      bytes: Buffer.concat([prefix, directory, record, locator, end]),
+      record: recordOffset, locator: recordOffset + record.length,
+      end: recordOffset + record.length + locator.length, directory: directoryOffset
+    };
+  }
+  function altered(fixture, edit) {
+    const result = { ...fixture, bytes: Buffer.from(fixture.bytes) };
+    edit(result.bytes, result);
+    return result.bytes;
+  }
+  async function reject(name, bytes, expression) {
+    await check(name, () => assert.rejects(current.readJarDirectory(memoryJar(bytes)), expression));
+  }
+
+  const ordinary = metadataZip(3);
+  const legacyMaximum = metadataZip(65535);
+  const zip64 = metadataZip(65536, { zip64: true });
+  const small64 = metadataZip(3, { zip64: true });
+  await check("ordinary legacy directory retains its Map entry contract", async () => {
+    const entries = await current.readJarDirectory(memoryJar(ordinary.bytes));
+    const actual = JSON.parse(JSON.stringify([...entries]));
+    assert.deepEqual(actual, Array.from({ length: 3 }, (_, index) => [
+      `entry-${String(index).padStart(6, "0")}`,
+      { flags: 0, method: 0, compressedSize: 0, size: 0, offset: 0, directoryOffset: 8 }
+    ]));
+  });
+  await check("empty legacy directory", async () => {
+    assert.equal((await current.readJarDirectory(memoryJar(metadataZip(0).bytes))).size, 0);
+  });
+  await check("legacy exactly 65535 without locator", async () => {
+    assert.equal((await current.readJarDirectory(memoryJar(legacyMaximum.bytes))).size, 65535);
+  });
+  await check("ZIP64 count 65536", async () => {
+    assert.equal((await current.readJarDirectory(memoryJar(zip64.bytes))).size, 65536);
+  });
+  for (const [name, fixture, count] of [
+    ["ZIP64 finite classic directory fields", metadataZip(65536, { zip64: true, countOnly: true }), 65536],
+    ["ZIP64 exact 65535", metadataZip(65535, { zip64: true }), 65535],
+    ["ZIP64 below count threshold", small64, 3],
+    ["ZIP64 locator outside maximum-comment tail", metadataZip(3, { zip64: true, comment: 65535 }), 3],
+    ["ZIP64 extended metadata record", metadataZip(3, { zip64: true, extended: 8 }), 3]
+  ]) {
+    await check(name, async () => assert.equal((await current.readJarDirectory(memoryJar(fixture.bytes))).size, count));
+  }
+  await reject("missing ZIP64 locator", altered(small64, (b, p) => b.writeUInt32LE(0, p.locator)), /locator is missing/);
+  await reject("multidisk locator disk", altered(small64, (b, p) => b.writeUInt32LE(1, p.locator + 4)), /multi-disk ZIP64 locator/);
+  await reject("multidisk locator total", altered(small64, (b, p) => b.writeUInt32LE(2, p.locator + 16)), /multi-disk ZIP64 locator/);
+  await reject("unsafe locator offset", altered(small64, (b, p) => b.writeBigUInt64LE(9007199254740992n, p.locator + 8)), /Unsafe ZIP64/);
+  await reject("out-of-bounds locator offset", altered(small64, (b, p) => b.writeBigUInt64LE(BigInt(p.locator), p.locator + 8)), /record offset/);
+  await reject("missing ZIP64 record signature", altered(small64, (b, p) => b.writeUInt32LE(0, p.record)), /record is missing/);
+  await reject("short ZIP64 record declaration", altered(small64, (b, p) => b.writeBigUInt64LE(43n, p.record + 4)), /record size/);
+  await reject("oversized ZIP64 record declaration", altered(small64, (b, p) => b.writeBigUInt64LE(1000n, p.record + 4)), /record size/);
+  await reject("unsafe ZIP64 record size", altered(small64, (b, p) => b.writeBigUInt64LE(9007199254740992n, p.record + 4)), /Unsafe ZIP64/);
+  await reject("multidisk ZIP64 record", altered(small64, (b, p) => b.writeUInt32LE(1, p.record + 16)), /multi-disk ZIP64 directory/);
+  await reject("ZIP64 per-disk count mismatch", altered(small64, (b, p) => b.writeBigUInt64LE(2n, p.record + 24)), /metadata mismatch/);
+  await reject("unsafe ZIP64 count", altered(small64, (b, p) => b.writeBigUInt64LE(9007199254740992n, p.record + 32)), /Unsafe ZIP64/);
+  await reject("unsafe ZIP64 directory size", altered(small64, (b, p) => b.writeBigUInt64LE(9007199254740992n, p.record + 40)), /Unsafe ZIP64/);
+  await reject("unsafe ZIP64 directory offset", altered(small64, (b, p) => b.writeBigUInt64LE(9007199254740992n, p.record + 48)), /Unsafe ZIP64/);
+  await reject("directory exceeds retained 16MiB bound", altered(small64, (b, p) => b.writeBigUInt64LE(16777217n, p.record + 40)), /invalid ZIP directory/);
+  await reject("directory overlaps ZIP64 record", altered(small64, (b, p) => b.writeBigUInt64LE(BigInt(p.record), p.record + 48)), /invalid ZIP directory/);
+  await reject("impossible ZIP64 count vs directory", altered(small64, (b, p) => {
+    b.writeBigUInt64LE(10000n, p.record + 24);
+    b.writeBigUInt64LE(10000n, p.record + 32);
+  }), /invalid ZIP directory/);
+  await reject("finite classic metadata mismatch", altered(small64, (b, p) => b.writeUInt16LE(2, p.end + 10)), /metadata mismatch/);
+  await reject("legacy multidisk", altered(ordinary, (b, p) => b.writeUInt16LE(1, p.end + 4)), /multi-disk ZIP directory/);
+  await reject("legacy disk-count mismatch", altered(ordinary, (b, p) => b.writeUInt16LE(2, p.end + 8)), /counts mismatch/);
+  await reject("multidisk directory entry", altered(ordinary, (b, p) => b.writeUInt16LE(1, p.directory + 34)), /multi-disk ZIP entry/);
+  await reject("malformed directory signature", altered(ordinary, (b, p) => b.writeUInt32LE(0, p.directory)), /Malformed ZIP directory/);
+  await reject("truncated directory entry", altered(ordinary, (b, p) => b.writeUInt16LE(65535, p.directory + 28)), /Truncated ZIP directory/);
+  await reject("duplicate directory name", altered(ordinary, (b, p) => b.copy(b, p.directory + 58 + 46, p.directory + 46, p.directory + 58)), /Duplicate ZIP entry/);
+  await reject("directory length/count mismatch", altered(ordinary, (b, p) => {
+    b.writeUInt16LE(2, p.end + 8);
+    b.writeUInt16LE(2, p.end + 10);
+  }), /length mismatch/);
+  await reject("truncated archive end", ordinary.bytes.subarray(0, ordinary.bytes.length - 1), /end directory is missing/);
+
+  function capabilityZip({ magic = true, required = true, mixins = true, method = 0, large = false } = {}) {
+    const names = ["ClientInputIsolation", "mixin/InputConstantsMixin", "mixin/MouseHandlerMixin", "mixin/KeyboardHandlerMixin"];
+    const files = names.map((name) => ({
+      name: `io/github/campione01/mineclientbridge/${name}.class`,
+      data: large ? Buffer.alloc(262145) : Buffer.from(magic ? "cafebabe00000041" : "0000000000000041", "hex")
+    }));
+    files.push({ name: "mineclient_bridge.mixins.json", data: Buffer.from(JSON.stringify({
+      required, package: "io.github.campione01.mineclientbridge.mixin",
+      client: mixins ? names.slice(1).map((name) => name.slice(6)) : [], injectors: { defaultRequire: 1 }
+    })) });
+    let position = 0;
+    const locals = [], directoryEntries = [];
+    for (const file of files) {
+      const name = Buffer.from(file.name);
+      const data = method === 8 ? deflateRawSync(file.data) : file.data;
+      const crc = zipCrc32(file.data);
+      const local = Buffer.alloc(30);
+      local.writeUInt32LE(0x04034b50);
+      local.writeUInt16LE(method, 8);
+      local.writeUInt32LE(crc, 14);
+      local.writeUInt32LE(data.length, 18);
+      local.writeUInt32LE(file.data.length, 22);
+      local.writeUInt16LE(name.length, 26);
+      locals.push(local, name, data);
+      const header = Buffer.alloc(46);
+      header.writeUInt32LE(0x02014b50);
+      header.writeUInt16LE(method, 10);
+      header.writeUInt32LE(crc, 16);
+      header.writeUInt32LE(data.length, 20);
+      header.writeUInt32LE(file.data.length, 24);
+      header.writeUInt16LE(name.length, 28);
+      header.writeUInt32LE(position, 42);
+      directoryEntries.push(header, name);
+      position += local.length + name.length + data.length;
+    }
+    const directory = Buffer.concat(directoryEntries);
+    const end = Buffer.alloc(22);
+    end.writeUInt32LE(0x06054b50);
+    end.writeUInt16LE(files.length, 8);
+    end.writeUInt16LE(files.length, 10);
+    end.writeUInt32LE(directory.length, 12);
+    end.writeUInt32LE(position, 16);
+    return Buffer.concat([...locals, directory, end]);
+  }
+  function mockDirectory(files) {
+    const mods = "C:\\zip64-directory-tests\\mods";
+    const entries = new Map(Object.entries(files).map(([name, bytes]) => [path.join(mods, name), bytes]));
+    return { mods, fs: {
+      async lstat(value) {
+        const directory = value === mods;
+        const bytes = entries.get(value);
+        assert(directory || bytes, "Unexpected synthetic filesystem path");
+        return { size: bytes?.length ?? 0, isDirectory: () => directory, isFile: () => !directory, isSymbolicLink: () => false };
+      },
+      async realpath(value) { return value; },
+      async readdir() { return Object.keys(files).map((name) => ({ name })); },
+      async open(value) { return memoryJar(entries.get(value)); }
+    } };
+  }
+  for (const method of [0, 8]) {
+    await check(`Bridge stored/deflate capability pass ${method}`, async () => {
+      const data = mockDirectory({ "bridge.jar": capabilityZip({ method }) });
+      await load(data.fs).assertPreparedInputIsolationJar(data.mods);
+    });
+  }
+  for (const [name, bytes, expected] of [
+    ["Bridge invalid class magic refusal", capabilityZip({ magic: false }), /invalid class/],
+    ["Bridge required=false refusal", capabilityZip({ required: false }), /fail-closed client mixin/],
+    ["Bridge missing mixin refusal", capabilityZip({ mixins: false }), /fail-closed client mixin/],
+    ["Bridge size cap unchanged", capabilityZip({ large: true }), /Unsupported input isolation/]
+  ]) {
+    await check(name, async () => {
+      const data = mockDirectory({ "bridge.jar": bytes });
+      await assert.rejects(load(data.fs).assertPreparedInputIsolationJar(data.mods), expected);
+    });
+  }
+  await check("Bridge exactly-one guard unchanged", async () => {
+    const data = mockDirectory({ "one.jar": capabilityZip(), "two.jar": capabilityZip() });
+    await assert.rejects(load(data.fs).assertPreparedInputIsolationJar(data.mods), /found 2/);
+  });
+  await check("ZIP64 non-Bridge plus valid Bridge verifies", async () => {
+    const data = mockDirectory({ "many.jar": zip64.bytes, "bridge.jar": capabilityZip() });
+    await load(data.fs).assertPreparedInputIsolationJar(data.mods);
+  });
+  await check("ZIP64 directory well above the legacy entry limit", async () => {
+    const fixture = metadataZip(70000, { zip64: true });
+    assert.equal((await current.readJarDirectory(memoryJar(fixture.bytes))).size, 70000);
+  });
+  await check("mods directory with ordinary JARs reads only the five public Bridge entries", async () => {
+    const files = Object.fromEntries(Array.from({ length: 9 }, (_, index) => [`ordinary-${index}.jar`, metadataZip(0).bytes]));
+    files["bridge.jar"] = capabilityZip();
+    const data = mockDirectory(files);
+    const reads = [];
+    await load(data.fs, (name) => reads.push(name)).assertPreparedInputIsolationJar(data.mods);
+    assert.equal(Object.keys(files).length, 10);
+    assert.deepEqual(reads, [
+      "io/github/campione01/mineclientbridge/ClientInputIsolation.class",
+      "io/github/campione01/mineclientbridge/mixin/InputConstantsMixin.class",
+      "io/github/campione01/mineclientbridge/mixin/MouseHandlerMixin.class",
+      "io/github/campione01/mineclientbridge/mixin/KeyboardHandlerMixin.class",
+      "mineclient_bridge.mixins.json"
+    ]);
+  });
+  assert.equal(cases.length, 45);
+  process.stdout.write(`ZIP64_TEST_OK cases=${cases.length} source_sha256=${sourceSha256}\n`);
 }
 
 function fixtureJar(variant = "current") {

@@ -48,6 +48,8 @@ Every tool declares a plain object input schema with no top-level `oneOf`, `anyO
 
 Launch roots are one-shot and must contain `final-preflight.json`, `launch.ps1`, and `launch/java-arguments.txt`. The launcher must preserve the MCP-provided `MINECLIENT_BRIDGE_*` environment variables when it starts Java. Every session is revalidated against its run ID, process ID, desktop, runtime root, evidence root, and authenticated bridge status.
 
+Before launch, the server reads the ZIP directory of every JAR in the prepared `mods` folder, including ZIP64 archives with more than 65,535 entries, and requires exactly one MineClient Bridge JAR with the input isolation classes. A JAR whose directory cannot be read safely, such as a multi-disk archive, stops the launch.
+
 Production descriptors are stored outside the repository. They contain the session token and must remain in a private user-owned directory. The MCP never returns or logs the token.
 
 ## Test
@@ -56,7 +58,7 @@ Production descriptors are stored outside the repository. They contain the sessi
 npm test
 ```
 
-The self-test covers all seven tools, launch and registration identity, PNG transport, bounded queries and inputs including commands and raw keys, release-before-close behavior, exact PID exit, and secret redaction.
+The self-test covers all seven tools, launch and registration identity, PNG transport, bounded queries and inputs including commands and raw keys, release-before-close behavior, exact PID exit, and secret redaction. It also checks the JAR directory reader against ordinary, ZIP64 and malformed archives; `node self-test.mjs --zip64-directory-only` runs just those cases.
 
 The transport gate also covers initialize/tools/list over real stdio, clean output,
 fragmented UTF-8, coalesced requests, CRLF, malformed JSON and complete/incomplete
