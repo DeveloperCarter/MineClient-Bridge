@@ -121,7 +121,8 @@ async function runSelfTest() {
       "minecraft_client_input",
       "minecraft_client_sequence",
       "minecraft_client_close",
-      "minecraft_client_reload_resources"
+      "minecraft_client_reload_resources",
+      "minecraft_client_hotswap"
     ]);
     for (const tool of listed.result.tools) {
       assert.equal(tool.inputSchema.type, "object", `${tool.name} must declare an object input schema`);

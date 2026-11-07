@@ -93,6 +93,9 @@ tasks.withType(JavaCompile).configureEach {
 tasks.test {
     useJUnitPlatform()
     systemProperty 'mineclientBridge.projectDir', project.projectDir.absolutePath
+    // [Arcane Academy fork] Exercise actual premain/redefine behavior in a small, game-free JVM.
+    dependsOn tasks.named('jar')
+    systemProperty 'mineclientBridge.agentJar', tasks.named('jar', Jar).get().archiveFile.get().asFile.absolutePath
 }
 
 tasks.withType(org.gradle.api.tasks.bundling.AbstractArchiveTask).configureEach {
@@ -109,4 +112,11 @@ tasks.withType(Jar).configureEach {
                 'Implementation-Title': mod_name,
                 'Implementation-Version': mod_version)
     }
+}
+
+// [Arcane Academy fork] The same development jar is both an FML mod and an optional Java agent.
+tasks.named('jar', Jar) {
+    manifest.attributes('Premain-Class': 'io.github.campione01.mineclientbridge.agent.BridgeAgent',
+            'Can-Redefine-Classes': 'true')
+    // No retransformation: the transformer only observes initial definitions.
 }

@@ -250,7 +250,7 @@ const tools = [
     description:
       "Run up to 100 steps against one registered client, in order, in one call. A step is any " +
       "minecraft_client_input kind with that kind's fields (no run_id), or {kind:'wait', ms}, " +
-      "{kind:'frame', save_as, overwrite?, include_image?}, {kind:'query', query, radius?, limit?}, or {kind:'reload_resources'}. " +
+      "{kind:'frame', save_as, overwrite?, include_image?}, {kind:'query', query, radius?, limit?}, {kind:'reload_resources'}, or {kind:'hotswap'}. " +
       "Every step is validated before any runs. Identity is rechecked before each step. Stops at the " +
       "first failing step unless continue_on_error is true.",
     inputSchema: {
@@ -287,6 +287,12 @@ const tools = [
   {
     name: "minecraft_client_reload_resources",
     description: "Reload resource packs (F3+T), wait for completion, and return duration_ms or the reload error. Requires isolated input. Also available as a reload_resources sequence step.",
+    inputSchema: runIdSchema(),
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  {
+    name: "minecraft_client_hotswap",
+    description: "Redefine changed, allowed, untransformed mod classes in one atomic batch. Requires the Java agent and isolated input. Reports swapped, refused (JVM reason), transformed, new_on_disk, unchanged_count and restart_required. Static fields keep their values; static initializers do not run again. Also a hotswap sequence step.",
     inputSchema: runIdSchema(),
     annotations: { destructiveHint: true, openWorldHint: false }
   }
@@ -468,6 +474,8 @@ async function callTool(params) {
       return textResult(await closeClient(args));
     case "minecraft_client_reload_resources":
       return textResult(await clientLiveOperation(args, "reload_resources"));
+    case "minecraft_client_hotswap":
+      return textResult(await clientLiveOperation(args, "hotswap"));
     default:
       throw new Error(`Unknown tool: ${params.name}`);
   }
@@ -856,8 +864,9 @@ function parseSequenceStep(step, runId, defaultSettle) {
   }
   switch (step.kind) {
     case "reload_resources":
+    case "hotswap":
       assertExactKeys(step, ["kind"]);
-      return { type: "live", kind: step.kind, endpoint: "/control/reload-resources" };
+      return { type: "live", kind: step.kind, endpoint: step.kind === "hotswap" ? "/control/hotswap" : "/control/reload-resources" };
     case "wait": {
       assertExactKeys(step, ["kind", "ms"]);
       if (!Number.isInteger(step.ms) || step.ms < 0 || step.ms > MAX_WAIT_STEP_MS) {
@@ -1875,6 +1884,11 @@ async function bridgeFetch(connection, method, endpoint, body, timeoutMs) {
         const parsed = JSON.parse(bytes.toString("utf8"));
         if (typeof parsed?.error === "string" && /^[a-z0-9_]{1,64}$/.test(parsed.error)) {
           code = ` (${parsed.error})`;
+        }
+        // [Arcane Academy fork] Live-operation errors need their actual reload/agent reason.
+        // Bound and redact it just like other tool output; never echo an unbounded HTTP body.
+        if (["/control/hotswap", "/control/reload-resources"].includes(endpoint) && typeof parsed?.detail === "string") {
+          code += `: ${sanitizeForOutput(parsed.detail, token).slice(0, 512).replace(/[\x00-\x1f]/g, " ")}`;
         }
       } catch {
         if (response.body) {

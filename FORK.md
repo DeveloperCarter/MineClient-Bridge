@@ -33,6 +33,8 @@ The clone lives at `C:\dev\MineClient-Bridge`, on branch `arcane`, with `origin`
 
 ## Releasing
 
+The unreleased live-reload spike is on `feature/live-reload`; see [candidate changelog](docs/changelog-1.1.8-aa.2.md). It is tested with a local jar and has no version bump or release approval. Do not run the release script as part of the spike. Feature-branch changes still use the tests above; Minecraft checks must end with a clean restart.
+
 1. Write `docs\changelog-<version>.md`.
 2. Commit your changes on `arcane`.
 3. Run the release script. It bumps the version in the five places it is written, builds, runs every test, commits, tags, and pushes:

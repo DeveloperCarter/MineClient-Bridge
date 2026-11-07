@@ -134,6 +134,7 @@ public final class BridgeServer {
             createdServer.createContext("/control/close", BridgeServer::handleControlClose);
             // [Arcane Academy fork] Development resource reload, equivalent to F3+T.
             createdServer.createContext("/control/reload-resources", BridgeServer::handleReloadResources);
+            createdServer.createContext("/control/hotswap", BridgeServer::handleHotswap);
             createdServer.createContext("/", BridgeServer::handleRoot);
 
             createdExecutor = Executors.newFixedThreadPool(HTTP_WORKERS, workerThreadFactory());
@@ -215,6 +216,18 @@ public final class BridgeServer {
             respondJson(exchange, 200, result);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "resource_reload_failed", e);
+        }
+    }
+
+    // [Arcane Academy fork] Dispatch through Minecraft.execute (the existing render dispatcher)
+    // and wait on the worker. Redefinition runs between frames, never on this HTTP thread.
+    private static void handleHotswap(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/hotswap", "POST")) return;
+        try {
+            JsonObject result = callOnMinecraftThread(HotSwapBridge::swap, 120);
+            respondJson(exchange, result.has("error") ? 409 : 200, result);
+        } catch (Exception e) {
+            respondMinecraftFailure(exchange, "hotswap_failed", e);
         }
     }
 
@@ -619,6 +632,7 @@ public final class BridgeServer {
         addOperation(operations, "POST", "/control/release-all", "release_keymaps");
         addOperation(operations, "POST", "/control/close", "graceful_client_stop");
         addOperation(operations, "POST", "/control/reload-resources", "resource_reload");
+        addOperation(operations, "POST", "/control/hotswap", "development_class_redefinition");
         obj.add("operations", operations);
 
         JsonObject limits = new JsonObject();

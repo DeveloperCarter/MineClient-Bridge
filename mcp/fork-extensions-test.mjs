@@ -179,12 +179,37 @@ try {
   assert.equal(reloadSequence.steps[0].result.duration_ms, 12);
   bridge.reloadError = true;
   await expectError("minecraft_client_reload_resources", { run_id: runId }, /resource_reload_failed/);
+  const reloadFailed = await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "reload_resources" }, { kind: "hotswap" }] });
+  assert.equal(JSON.parse(reloadFailed.content[0].text).steps_run, 1);
+  assert.match(reloadFailed.content[0].text, /fixture failure/);
   bridge.reloadError = false;
   bridge.isolation = { ...INPUT_ISOLATION, enabled: false };
   await expectError("minecraft_client_reload_resources", { run_id: runId }, /isolation/);
   bridge.isolation = INPUT_ISOLATION;
 
-  console.log("FORK_EXTENSIONS_TEST_OK attach=folder frame=saved chat=query settle=passthrough sequence=ordered stale=replaced errors=coded");
+  const swapTool = (await client.request("tools/list", {})).result.tools.find(t => t.name === "minecraft_client_hotswap");
+  assert.deepEqual(swapTool.inputSchema.required, ["run_id"]);
+  assert.equal(swapTool.inputSchema.additionalProperties, false);
+  const swap = payload(await client.callTool("minecraft_client_hotswap", { run_id: runId })).result;
+  assert.deepEqual(swap.swapped, ["dev.example.Hud"]);
+  assert.match(swap.static_fields_note, /Static fields/);
+  assert.equal(swap.restart_required, false);
+  await expectError("minecraft_client_hotswap", { run_id: runId, packages: "java" }, /exactly/);
+  const swapSequence = payload(await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "hotswap" }] }));
+  assert.deepEqual(swapSequence.steps[0].result.swapped, swap.swapped);
+  await expectError("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "hotswap", roots: "other" }] }, /step 0/);
+  bridge.agentMissing = true;
+  await expectError("minecraft_client_hotswap", { run_id: runId }, /agent not loaded/);
+  const missingSequence = await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "hotswap" }, { kind: "reload_resources" }] });
+  assert.equal(JSON.parse(missingSequence.content[0].text).steps_run, 1);
+  bridge.agentMissing = false;
+  bridge.isolation = { ...INPUT_ISOLATION, enabled: false };
+  await expectError("minecraft_client_hotswap", { run_id: runId }, /isolation/);
+  const isolatedSwap = await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "hotswap" }] });
+  assert.equal(isolatedSwap.isError, true);
+  bridge.isolation = INPUT_ISOLATION;
+
+  console.log("FORK_EXTENSIONS_TEST_OK attach=folder frame=saved chat=query settle=passthrough sequence=ordered stale=replaced errors=coded reload=duration-error hotswap=report-agent-error");
 } finally {
   await client?.end().catch(() => client?.kill());
   await bridge?.close();
@@ -242,8 +267,13 @@ async function createFixtureBridge(identity) {
     }
     if (url.pathname === "/control/reload-resources") {
       return state.reloadError
-        ? json(response, 500, { ok: false, error: "resource_reload_failed", message: "fixture failure" })
+        ? json(response, 500, { ok: false, error: "resource_reload_failed", detail: `fixture failure ${token}` })
         : json(response, 200, { ok: true, duration_ms: 12 });
+    }
+    if (url.pathname === "/control/hotswap") {
+      return state.agentMissing
+        ? json(response, 409, { ok: false, error: "agent_not_loaded", detail: "agent not loaded" })
+        : json(response, 200, { ok: true, swapped: ["dev.example.Hud"], refused: [], transformed: [], new_on_disk: [], unchanged_count: 2, restart_required: false, static_fields_note: "Static fields keep their values; static initializers do not run again." });
     }
     if (request.method === "POST" && body?.command === "fail-not-in-world") {
       return json(response, 409, { ok: false, error: "not_in_world" });
