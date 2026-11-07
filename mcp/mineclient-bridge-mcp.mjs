@@ -250,7 +250,7 @@ const tools = [
     description:
       "Run up to 100 steps against one registered client, in order, in one call. A step is any " +
       "minecraft_client_input kind with that kind's fields (no run_id), or {kind:'wait', ms}, " +
-      "{kind:'frame', save_as, overwrite?, include_image?}, or {kind:'query', query, radius?, limit?}. " +
+      "{kind:'frame', save_as, overwrite?, include_image?}, {kind:'query', query, radius?, limit?}, or {kind:'reload_resources'}. " +
       "Every step is validated before any runs. Identity is rechecked before each step. Stops at the " +
       "first failing step unless continue_on_error is true.",
     inputSchema: {
@@ -280,6 +280,13 @@ const tools = [
   {
     name: "minecraft_client_close",
     description: "Release all input, gracefully close, and forget one exact registered Minecraft client session.",
+    inputSchema: runIdSchema(),
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  // [Arcane Academy fork] A reload completes only when Minecraft's reload future completes.
+  {
+    name: "minecraft_client_reload_resources",
+    description: "Reload resource packs (F3+T), wait for completion, and return duration_ms or the reload error. Requires isolated input. Also available as a reload_resources sequence step.",
     inputSchema: runIdSchema(),
     annotations: { destructiveHint: true, openWorldHint: false }
   }
@@ -459,6 +466,8 @@ async function callTool(params) {
       return textResult(await clientInput(args));
     case "minecraft_client_close":
       return textResult(await closeClient(args));
+    case "minecraft_client_reload_resources":
+      return textResult(await clientLiveOperation(args, "reload_resources"));
     default:
       throw new Error(`Unknown tool: ${params.name}`);
   }
@@ -798,6 +807,10 @@ async function clientSequence(args) {
           bridge = await requestJson(descriptor, "POST", step.parsed.endpoint, step.parsed.body);
         }
         results.push({ index, kind: step.parsed.kind, ok: true, bridge: sanitizeForOutput(bridge, descriptor.token) });
+      } else if (step.type === "live") {
+        assertInputIsolation(descriptor, status);
+        const result = await requestJson(descriptor, "POST", step.endpoint, undefined, 125_000);
+        results.push({ index, kind: step.kind, ok: true, result: sanitizeForOutput(result, descriptor.token) });
       } else if (step.type === "frame") {
         const frame = await requestPng(descriptor, "/control/frame");
         const saved = step.options.saveAs
@@ -842,6 +855,9 @@ function parseSequenceStep(step, runId, defaultSettle) {
     throw new Error("steps take no run_id; the sequence's run_id applies to every step");
   }
   switch (step.kind) {
+    case "reload_resources":
+      assertExactKeys(step, ["kind"]);
+      return { type: "live", kind: step.kind, endpoint: "/control/reload-resources" };
     case "wait": {
       assertExactKeys(step, ["kind", "ms"]);
       if (!Number.isInteger(step.ms) || step.ms < 0 || step.ms > MAX_WAIT_STEP_MS) {
@@ -889,6 +905,17 @@ async function clientQuery(args) {
     kind: parsed.kind,
     result: sanitizeForOutput(result, descriptor.token)
   };
+}
+
+// [Arcane Academy fork] Keep the same identity and input-isolation gate as other mutations.
+async function clientLiveOperation(args, kind) {
+  const runId = parseRunIdOnly(args);
+  const descriptor = await readDescriptor(runId);
+  const status = await revalidateSession(descriptor);
+  assertInputIsolation(descriptor, status);
+  const endpoint = kind === "reload_resources" ? "/control/reload-resources" : "/control/hotswap";
+  const result = await requestJson(descriptor, "POST", endpoint, undefined, 125_000);
+  return { run_id: runId, process_id: descriptor.process_id, result: sanitizeForOutput(result, descriptor.token) };
 }
 
 async function clientInput(args) {

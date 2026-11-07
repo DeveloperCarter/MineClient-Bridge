@@ -15,7 +15,7 @@ class BridgeServerContractTest {
         String source = Files.readString(project.resolve(
                 "src/main/java/io/github/campione01/mineclientbridge/BridgeServer.java"));
 
-        assertEquals(15, occurrences(source, "createContext(\"/control/"));
+        assertEquals(16, occurrences(source, "createContext(\"/control/"));
         assertTrue(source.contains("MAX_BODY_BYTES = 64 * 1024"));
         assertTrue(source.contains("MAX_JSON_BYTES = 256 * 1024"));
         assertTrue(source.contains("MAX_FRAME_BYTES = 32 * 1024 * 1024"));

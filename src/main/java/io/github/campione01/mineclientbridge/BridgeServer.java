@@ -132,6 +132,8 @@ public final class BridgeServer {
             createdServer.createContext("/control/command", BridgeServer::handleControlCommand);
             createdServer.createContext("/control/release-all", BridgeServer::handleControlReleaseAll);
             createdServer.createContext("/control/close", BridgeServer::handleControlClose);
+            // [Arcane Academy fork] Development resource reload, equivalent to F3+T.
+            createdServer.createContext("/control/reload-resources", BridgeServer::handleReloadResources);
             createdServer.createContext("/", BridgeServer::handleRoot);
 
             createdExecutor = Executors.newFixedThreadPool(HTTP_WORKERS, workerThreadFactory());
@@ -197,6 +199,23 @@ public final class BridgeServer {
 
     private static void handleRoot(HttpExchange exchange) throws IOException {
         respondJson(exchange, 404, error("unknown_endpoint"));
+    }
+
+    // [Arcane Academy fork] Never join the reload future on the render thread: its work needs
+    // subsequent frames. Start there, then wait on the HTTP worker until the future completes.
+    private static void handleReloadResources(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/reload-resources", "POST")) return;
+        long started = System.nanoTime();
+        try {
+            CompletableFuture<Void> reload = callOnMinecraftThread(
+                    () -> Minecraft.getInstance().reloadResourcePacks(), MINECRAFT_TIMEOUT_SECONDS);
+            reload.get(120, TimeUnit.SECONDS);
+            JsonObject result = ok();
+            result.addProperty("duration_ms", TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+            respondJson(exchange, 200, result);
+        } catch (Exception e) {
+            respondMinecraftFailure(exchange, "resource_reload_failed", e);
+        }
     }
 
     private static void handleControlStatus(HttpExchange exchange) throws IOException {
@@ -599,6 +618,7 @@ public final class BridgeServer {
         addOperation(operations, "POST", "/control/command", "minecraft_command");
         addOperation(operations, "POST", "/control/release-all", "release_keymaps");
         addOperation(operations, "POST", "/control/close", "graceful_client_stop");
+        addOperation(operations, "POST", "/control/reload-resources", "resource_reload");
         obj.add("operations", operations);
 
         JsonObject limits = new JsonObject();

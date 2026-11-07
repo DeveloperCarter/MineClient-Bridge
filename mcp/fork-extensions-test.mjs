@@ -169,6 +169,21 @@ try {
   assert.match(JSON.parse(blocked.content[0].text).steps[0].error, /isolation/);
   bridge.isolation = INPUT_ISOLATION;
 
+  // [Arcane Academy fork] Live reload schema, duration, error, sequence and isolation contract.
+  const reloadTool = (await client.request("tools/list", {})).result.tools.find(t => t.name === "minecraft_client_reload_resources");
+  assert.deepEqual(reloadTool.inputSchema.required, ["run_id"]);
+  assert.equal(reloadTool.inputSchema.additionalProperties, false);
+  assert.equal(payload(await client.callTool("minecraft_client_reload_resources", { run_id: runId })).result.duration_ms, 12);
+  await expectError("minecraft_client_reload_resources", { run_id: runId, path: "other" }, /exactly|Unexpected/);
+  const reloadSequence = payload(await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "reload_resources" }] }));
+  assert.equal(reloadSequence.steps[0].result.duration_ms, 12);
+  bridge.reloadError = true;
+  await expectError("minecraft_client_reload_resources", { run_id: runId }, /resource_reload_failed/);
+  bridge.reloadError = false;
+  bridge.isolation = { ...INPUT_ISOLATION, enabled: false };
+  await expectError("minecraft_client_reload_resources", { run_id: runId }, /isolation/);
+  bridge.isolation = INPUT_ISOLATION;
+
   console.log("FORK_EXTENSIONS_TEST_OK attach=folder frame=saved chat=query settle=passthrough sequence=ordered stale=replaced errors=coded");
 } finally {
   await client?.end().catch(() => client?.kill());
@@ -224,6 +239,11 @@ async function createFixtureBridge(identity) {
     }
     if (url.pathname === "/control/chat") {
       return json(response, 200, { ok: true, action_bar: { showing: false }, messages: [{ text: "fixture line", added_tick: 1 }] });
+    }
+    if (url.pathname === "/control/reload-resources") {
+      return state.reloadError
+        ? json(response, 500, { ok: false, error: "resource_reload_failed", message: "fixture failure" })
+        : json(response, 200, { ok: true, duration_ms: 12 });
     }
     if (request.method === "POST" && body?.command === "fail-not-in-world") {
       return json(response, 409, { ok: false, error: "not_in_world" });
