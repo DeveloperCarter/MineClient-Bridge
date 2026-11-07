@@ -1,5 +1,7 @@
 # MineClient Bridge
 
+> **Arcane Academy fork.** This is Carter's fork of Campione01/MineClient-Bridge. What it changes, how it is released, and how to take upstream updates are in [FORK.md](FORK.md).
+
 ![MineClient Bridge](docs/assets/mineclient-bridge-avatar-400.png)
 
 MineClient Bridge is a client-side NeoForge 1.21.1 mod that exposes an authenticated HTTP interface on the local loopback address. External tools can inspect the active Minecraft client, capture its current framebuffer, and operate configured keys and GUI controls. Isolated background sessions use process-local virtual input rather than the operating system cursor and clipboard.
