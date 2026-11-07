@@ -1,6 +1,6 @@
-# MineClient Bridge 1.1.8-aa.2 — unreleased live-reload spike
+# MineClient Bridge 1.1.8-aa.2 (Arcane Academy fork)
 
-Feature branch: `feature/live-reload`, based on `arcane`. This is a candidate changelog, not a release: versions remain `1.1.8-aa.1`, no tag or artifact has been published, and Carter decides whether to release it. See [FORK.md](../FORK.md).
+Live reload for development clients: reload resource packs, and hot-swap changed method bodies of your own mod without restarting. Built on `feature/live-reload` and released on 7 November 2026 with Carter's approval. See [FORK.md](../FORK.md).
 
 ## Resource reload
 
@@ -22,7 +22,7 @@ Feature branch: `feature/live-reload`, based on `arcane`. This is a candidate ch
 
 - `npm --prefix mcp test`: tool lists/schemas, exact arguments, identity/isolation gates, ordered sequence steps, reload duration/failure, and missing-agent errors. Errors are bounded/redacted.
 - `.\gradlew.bat build`: **73 passing JVM tests**, including game-free hash/change/report unit tests and an actual child JVM using the agent. The real-JVM test checks changed method bodies, retained static state, a refused two-class schema-change batch with both old bodies intact, retry after removing the schema change, normal first loading of a new-on-disk class, and skipping bytes changed by a custom class loader. A separate regression test covers generated hidden lambdas.
-- Minecraft evidence and release recommendation are recorded after the local spike run below; every checklist ends with a clean client restart. The wizard-modpack pin stays unchanged and its feature branch uses `-PbridgeJar`.
+- Minecraft evidence and release recommendation are recorded after the local spike run below; every checklist ends with a clean client restart. The spike itself ran with a local jar through `-PbridgeJar`; wizard-modpack moves its pin to this release.
 
 ## Local Minecraft verification
 
@@ -45,6 +45,6 @@ Wizard-modpack `.\gradlew.bat build` passed **84 unit tests**; `.\gradlew.bat ru
 
 Observed unrelated diagnostics: FTB XMod Compat's optional FTB Quests JEI plugin logged `NoClassDefFoundError: ...ClientQuestFile` when loading the world (FTB Quests is absent). Some normal bridge closes logged the existing shutdown-hook input-release timeout after the render loop stopped; close requests had already released input and all processes exited normally. Neither was changed in this spike. Physical-input feel remains Carter's assessment.
 
-**Recommendation:** release as `1.1.8-aa.2` when Carter approves. Resource reload is independently useful, and all three requested method-body swaps worked with no real own-mod transformation blockers in this run. Keep the package/root restrictions, static-state caveat, atomic refusal, and mandatory clean restart. Current branch is still unreleased; do not change the pin or run the release script without Carter's decision.
+**Outcome:** Carter approved the release on 7 November 2026. Resource reload is independently useful, and all three requested method-body swaps worked with no real own-mod transformation blockers in this run. The package/root restrictions, static-state caveat, atomic refusal, and mandatory clean restart stay as they are.
 
 API contract references: [Java 21 Instrumentation](https://docs.oracle.com/en/java/javase/21/docs/api/java.instrument/java/lang/instrument/Instrumentation.html) (atomic redefine, static state and schema restrictions), [ClassFileTransformer](https://docs.oracle.com/en/java/javase/21/docs/api/java.instrument/java/lang/instrument/ClassFileTransformer.html) (definition/redefinition observation).
