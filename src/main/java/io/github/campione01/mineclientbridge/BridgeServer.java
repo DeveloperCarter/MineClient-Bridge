@@ -60,7 +60,6 @@ import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
-import net.neoforged.neoforge.client.ClientHooks;
 import org.lwjgl.glfw.GLFW;
 
 public final class BridgeServer {
@@ -85,6 +84,7 @@ public final class BridgeServer {
     private static final double MAX_GUI_COORDINATE = 1_000_000.0;
     private static final long MINECRAFT_TIMEOUT_SECONDS = 5;
     private static final long FRAME_TIMEOUT_SECONDS = 15;
+    private static final long SETTLE_TIMEOUT_MILLIS = 5_000;
     private static final AtomicInteger WORKER_SEQUENCE = new AtomicInteger();
     private static final AtomicReference<OptionalRenderDispatcher.Route> LOGGED_DISPATCH_ROUTE =
             new AtomicReference<>();
@@ -123,6 +123,7 @@ public final class BridgeServer {
             createdServer.createContext("/control/keymaps", BridgeServer::handleControlKeymaps);
             createdServer.createContext("/control/state", BridgeServer::handleControlState);
             createdServer.createContext("/control/screen", BridgeServer::handleControlScreen);
+            createdServer.createContext("/control/chat", BridgeServer::handleControlChat);
             createdServer.createContext("/control/key", BridgeServer::handleControlKey);
             createdServer.createContext("/control/raw-key", BridgeServer::handleControlRawKey);
             createdServer.createContext("/control/look", BridgeServer::handleControlLook);
@@ -276,11 +277,72 @@ public final class BridgeServer {
         }
     }
 
+    // [Arcane Academy fork] Recent chat and the action-bar message as text; see ChatSnapshot.
+    private static void handleControlChat(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/chat", "GET")) return;
+
+        final int limit;
+        try {
+            limit = (int) queryDouble(exchange, "limit", ChatSnapshot.DEFAULT_MESSAGES, 1.0,
+                    ChatSnapshot.MAX_MESSAGES);
+        } catch (RequestException e) {
+            respondRequestFailure(exchange, e);
+            return;
+        }
+
+        try {
+            JsonObject chat = callOnMinecraftThread(
+                    () -> ChatSnapshot.create(limit),
+                    MINECRAFT_TIMEOUT_SECONDS);
+            respondJson(exchange, 200, chat);
+        } catch (Exception e) {
+            respondMinecraftFailure(exchange, "chat_failed", e);
+        }
+    }
+
+    // [Arcane Academy fork] Every input request takes an optional settle_ticks (0 to
+    // TickClock.MAX_SETTLE_TICKS): after the input is applied, the response waits until that many
+    // client ticks have finished, so the game has processed it. Returns -1 after answering 400.
+    private static int settleTicksOrRespond(HttpExchange exchange, JsonObject body) throws IOException {
+        try {
+            int ticks = optionalInteger(body, "settle_ticks", 0);
+            if (ticks < 0 || ticks > TickClock.MAX_SETTLE_TICKS) {
+                throw new RequestException(400, "invalid_settle_ticks",
+                        "settle_ticks must be between 0 and " + TickClock.MAX_SETTLE_TICKS);
+            }
+            return ticks;
+        } catch (RequestException e) {
+            respondRequestFailure(exchange, e);
+            return -1;
+        }
+    }
+
+    private static void respondSettled(HttpExchange exchange, EndpointResult result, int settleTicks)
+            throws IOException {
+        JsonObject body = result.body();
+        if (settleTicks > 0 && result.status() == 200) {
+            body.addProperty("settle_ticks", settleTicks);
+            try {
+                body.addProperty("client_tick", TickClock.awaitTicks(settleTicks, SETTLE_TIMEOUT_MILLIS));
+                body.addProperty("settled", true);
+            } catch (TimeoutException e) {
+                // The input was applied; only the wait ran out (for example, the client froze).
+                body.addProperty("settled", false);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                body.addProperty("settled", false);
+            }
+        }
+        respondJson(exchange, result.status(), body);
+    }
+
     private static void handleControlKey(HttpExchange exchange) throws IOException {
         if (!requireControlAccess(exchange, "/control/key", "POST")) return;
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final String mapping;
         final String action;
@@ -304,7 +366,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyKeyAction(mapping, action, exact),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "key_action_failed", e);
         }
@@ -315,6 +377,8 @@ public final class BridgeServer {
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final String key;
         final String action;
@@ -336,7 +400,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyRawKeyAction(key, action),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "raw_key_action_failed", e);
         }
@@ -347,6 +411,8 @@ public final class BridgeServer {
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final double yaw;
         final double pitch;
@@ -364,7 +430,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyLook(yaw, pitch, relative),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "look_action_failed", e);
         }
@@ -375,6 +441,8 @@ public final class BridgeServer {
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final double x;
         final double y;
@@ -414,7 +482,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyMouseAction(x, y, button, action, scrollY),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "mouse_action_failed", e);
         }
@@ -425,6 +493,8 @@ public final class BridgeServer {
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final String text;
         final boolean submit;
@@ -441,7 +511,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyScreenText(text, submit),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "text_input_failed", e);
         }
@@ -452,6 +522,8 @@ public final class BridgeServer {
 
         JsonObject body = readJsonObjectOrRespond(exchange, false);
         if (body == null) return;
+        final int settleTicks = settleTicksOrRespond(exchange, body);
+        if (settleTicks < 0) return;
 
         final String command;
         try {
@@ -465,7 +537,7 @@ public final class BridgeServer {
             EndpointResult result = callOnMinecraftThread(
                     () -> applyCommand(command),
                     MINECRAFT_TIMEOUT_SECONDS);
-            respondJson(exchange, result.status(), result.body());
+            respondSettled(exchange, result, settleTicks);
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "command_submission_failed", e);
         }
@@ -518,6 +590,7 @@ public final class BridgeServer {
         addOperation(operations, "GET", "/control/keymaps", "keymap_discovery");
         addOperation(operations, "GET", "/control/state", "client_state_snapshot");
         addOperation(operations, "GET", "/control/screen", "screen_snapshot");
+        addOperation(operations, "GET", "/control/chat", "chat_snapshot");
         addOperation(operations, "POST", "/control/key", "keymap_input");
         addOperation(operations, "POST", "/control/raw-key", "internal_keyboard_input");
         addOperation(operations, "POST", "/control/look", "player_view");
@@ -541,7 +614,10 @@ public final class BridgeServer {
         limits.addProperty("container_slots_max", MAX_CONTAINER_SLOTS);
         limits.addProperty("text_characters_max", MAX_TEXT_LENGTH);
         limits.addProperty("command_characters_max", MAX_COMMAND_LENGTH);
+        limits.addProperty("settle_ticks_max", TickClock.MAX_SETTLE_TICKS);
+        limits.addProperty("chat_messages_max", ChatSnapshot.MAX_MESSAGES);
         obj.add("limits", limits);
+        obj.addProperty("tick_clock", TickClock.installed());
 
         JsonObject safety = new JsonObject();
         safety.addProperty("loopback_only", true);
@@ -1392,15 +1468,18 @@ public final class BridgeServer {
         ArrayList<InputEventProbe.Observation> observed = new ArrayList<>();
         int events = 0;
         boolean handled;
+        int slotBefore = mc.player.getInventory().selected;
         if (action.equals("scroll")) {
+            // [Arcane Academy fork] Through MouseHandler.onScroll, the method a physical wheel
+            // drives, rather than the NeoForge hook plus swapPaint. That keeps vanilla's scroll
+            // sensitivity, discrete-scroll option, partial-scroll accumulation and spectator
+            // handling (fly speed or the spectator menu instead of the hotbar). onScroll still fires
+            // the NeoForge scroll event, so mods see the same event as before.
             long probeSequence = InputEventProbe.scrollSequence();
-            handled = ClientHooks.onMouseScroll(mc.mouseHandler, 0.0, scrollY);
+            mc.mouseHandler.onScroll(mc.getWindow().getWindow(), 0.0, scrollY);
             addObserved(observed, InputEventProbe.scrollSince(probeSequence));
             events = 1;
-            if (!handled) {
-                mc.player.getInventory().swapPaint(scrollY);
-                handled = true;
-            }
+            handled = true;
         } else {
             switch (action) {
                 case "down" -> {
@@ -1443,6 +1522,11 @@ public final class BridgeServer {
         obj.addProperty("down", HELD_WORLD_MOUSE_BUTTONS.contains(button));
         obj.addProperty("events", events);
         obj.addProperty("mouse_grabbed", mc.mouseHandler.isMouseGrabbed());
+        if (action.equals("scroll")) {
+            obj.addProperty("selected_slot_before", slotBefore);
+            obj.addProperty("selected_slot_after", mc.player.getInventory().selected);
+            obj.addProperty("spectator", mc.player.isSpectator());
+        }
         addEventDelivery(obj, observed);
         return new EndpointResult(200, obj);
     }

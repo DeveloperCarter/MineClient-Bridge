@@ -15,7 +15,7 @@ class BridgeServerContractTest {
         String source = Files.readString(project.resolve(
                 "src/main/java/io/github/campione01/mineclientbridge/BridgeServer.java"));
 
-        assertEquals(14, occurrences(source, "createContext(\"/control/"));
+        assertEquals(15, occurrences(source, "createContext(\"/control/"));
         assertTrue(source.contains("MAX_BODY_BYTES = 64 * 1024"));
         assertTrue(source.contains("MAX_JSON_BYTES = 256 * 1024"));
         assertTrue(source.contains("MAX_FRAME_BYTES = 32 * 1024 * 1024"));
@@ -31,7 +31,10 @@ class BridgeServerContractTest {
         assertTrue(source.contains("MAX_COMMAND_LENGTH = 256"));
         assertTrue(source.contains("command = command.substring(1).stripLeading()"));
         assertTrue(source.contains("command.length() > MAX_COMMAND_LENGTH"));
-        assertTrue(source.contains("ClientHooks.onMouseScroll"));
+        // [Arcane Academy fork] World scroll goes through the wheel's own method, not the hook.
+        assertTrue(source.contains("mc.mouseHandler.onScroll(mc.getWindow().getWindow(), 0.0, scrollY)"));
+        assertFalse(source.contains("swapPaint("));
+        assertEquals(6, occurrences(source, "respondSettled(exchange, result, settleTicks);"));
         assertTrue(source.contains("HELD_WORLD_MOUSE_BUTTONS"));
         assertTrue(source.contains("HELD_WORLD_MOUSE_BUTTONS.contains(button) && action.equals(\"down\")"));
         assertTrue(source.contains("obj.addProperty(\"screen_transition\", true)"));
@@ -101,6 +104,7 @@ class BridgeServerContractTest {
         assertTrue(accessTransformer.contains("public net.minecraft.client.MouseHandler isLeftPressed"));
         assertTrue(accessTransformer.contains("public net.minecraft.client.MouseHandler isRightPressed"));
         assertTrue(accessTransformer.contains("public net.minecraft.client.MouseHandler isMiddlePressed"));
+        assertTrue(accessTransformer.contains("public net.minecraft.client.MouseHandler onScroll(JDD)V"));
     }
 
     private static int occurrences(String source, String needle) {

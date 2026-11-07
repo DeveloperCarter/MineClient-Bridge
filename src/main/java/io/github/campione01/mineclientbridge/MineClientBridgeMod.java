@@ -12,6 +12,7 @@ public final class MineClientBridgeMod {
 
     public MineClientBridgeMod(IEventBus modEventBus) {
         InputEventProbe.install();
+        TickClock.install();
         BridgeServer.start();
         Runtime.getRuntime().addShutdownHook(new Thread(
                 BridgeServer::stop,
