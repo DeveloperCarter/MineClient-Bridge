@@ -29,7 +29,7 @@ if ($branch -ne 'arcane') { throw "Release from the arcane branch (currently on 
 if (git tag --list "v$Version") { throw "Tag v$Version already exists." }
 if (-not (Test-Path "docs/changelog-$Version.md")) { throw "Write docs/changelog-$Version.md first." }
 
-$current = ((Get-Content gradle.properties) | Where-Object { $_ -match '^mod_version=' })[0].Split('=', 2)[1].Trim()
+$current = @((Get-Content gradle.properties) | Where-Object { $_ -match '^mod_version=' })[0].Split('=', 2)[1].Trim()
 if ($current -eq $Version) { throw "mod_version is already $Version." }
 
 # Every place the version is written, as exact before/after strings, so nothing else changes.
