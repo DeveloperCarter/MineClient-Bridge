@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { inflateRawSync } from "node:zlib";
 
 const SERVER_NAME = "mineclient-bridge";
-const SERVER_VERSION = "1.1.8";
+const SERVER_VERSION = "1.1.8-aa.1";
 const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_PREPARED_ROOT_PARENT = path.win32.join(
   fsSync.realpathSync.native(os.tmpdir()),
@@ -41,6 +41,14 @@ const BRIDGE_CLASS_ROOT = "io/github/campione01/mineclientbridge/";
 const ISOLATION_MIXINS = ["InputConstantsMixin", "MouseHandlerMixin", "KeyboardHandlerMixin"];
 const ISOLATION_MIXIN_CONFIG = "mineclient_bridge.mixins.json";
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// [Arcane Academy fork] Limits for saved frames, sequences and settled input.
+const EVIDENCE_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
+const MAX_SEQUENCE_STEPS = 100;
+const MAX_SEQUENCE_WAIT_MS = 120_000;
+const MAX_WAIT_STEP_MS = 10_000;
+const MAX_SETTLE_TICKS = 40;
+const MAX_CHAT_MESSAGES = 100;
+const MAX_ERROR_BODY_BYTES = 4096;
 const DESCRIPTOR_KEYS = [
   "run_id",
   "base_url",
@@ -96,6 +104,24 @@ const tools = [
     annotations: { destructiveHint: true, openWorldHint: false }
   },
   {
+    name: "minecraft_client_attach",
+    description:
+      "Register an already-running client from its game folder. Reads the bridge token from " +
+      "<runtime_root>\\config\\mineclient-bridge.token and the identity from the bridge's own status, " +
+      "then applies the same checks as minecraft_client_register. Attaching a client that is already " +
+      "registered and running returns its session; registrations whose process has exited are replaced.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        runtime_root: { type: "string", description: "The client's game folder, as an absolute Windows path." },
+        base_url: { type: "string", description: "Canonical numeric loopback HTTP origin with an explicit port." }
+      },
+      required: ["runtime_root", "base_url"],
+      additionalProperties: false
+    },
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  {
     name: "minecraft_client_status",
     description: "Read status for one registered Minecraft client after exact bridge identity revalidation.",
     inputSchema: runIdSchema(),
@@ -103,8 +129,24 @@ const tools = [
   },
   {
     name: "minecraft_client_frame",
-    description: "Capture the current PNG frame from one registered Minecraft client.",
-    inputSchema: runIdSchema(),
+    description:
+      "Capture the current PNG frame from one registered Minecraft client. With save_as, also write it " +
+      "to <evidence_root>\\<save_as>.png; set include_image false to return only the saved path.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+        save_as: {
+          type: "string",
+          maxLength: 100,
+          description: "File name to save in the evidence folder: letters, digits, dot, underscore, hyphen. .png is added if missing."
+        },
+        overwrite: { type: "boolean", description: "Replace an existing file of that name. Default false." },
+        include_image: { type: "boolean", description: "Return the image in the reply. Default true." }
+      },
+      required: ["run_id"],
+      additionalProperties: false
+    },
     annotations: { readOnlyHint: true, openWorldHint: false }
   },
   {
@@ -118,14 +160,20 @@ const tools = [
         run_id: { type: "string" },
         kind: {
           type: "string",
-          enum: ["capabilities", "screen", "keymaps", "state"],
-          description: "View to read. Only state accepts radius."
+          enum: ["capabilities", "screen", "keymaps", "state", "chat"],
+          description: "View to read. Only state accepts radius; only chat accepts limit. chat returns recent chat lines (newest first) and the action-bar message."
         },
         radius: {
           type: "integer",
           minimum: 1,
           maximum: 32,
           description: "Nearby entity radius, for kind state only."
+        },
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "Number of chat messages, for kind chat only. Default 20."
         }
       },
       required: ["run_id", "kind"],
@@ -182,9 +230,49 @@ const tools = [
           type: "string",
           maxLength: 512,
           description: "Minecraft command with or without a leading slash, for kind command."
+        },
+        settle_ticks: {
+          type: "integer",
+          minimum: 0,
+          maximum: 40,
+          description:
+            "Every kind except release_all: after applying the input, wait until this many client ticks " +
+            "have finished before answering, so the game has processed it. 1 is enough for key taps."
         }
       },
       required: ["run_id", "kind"],
+      additionalProperties: false
+    },
+    annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  {
+    name: "minecraft_client_sequence",
+    description:
+      "Run up to 100 steps against one registered client, in order, in one call. A step is any " +
+      "minecraft_client_input kind with that kind's fields (no run_id), or {kind:'wait', ms}, " +
+      "{kind:'frame', save_as, overwrite?, include_image?}, or {kind:'query', query, radius?, limit?}. " +
+      "Every step is validated before any runs. Identity is rechecked before each step. Stops at the " +
+      "first failing step unless continue_on_error is true.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+        steps: {
+          type: "array",
+          minItems: 1,
+          maxItems: 100,
+          items: { type: "object" },
+          description: "Steps to run in order."
+        },
+        default_settle_ticks: {
+          type: "integer",
+          minimum: 0,
+          maximum: 40,
+          description: "settle_ticks for every input step that does not set its own."
+        },
+        continue_on_error: { type: "boolean", description: "Keep going after a failed step. Default false." }
+      },
+      required: ["run_id", "steps"],
       additionalProperties: false
     },
     annotations: { destructiveHint: true, openWorldHint: false }
@@ -357,6 +445,10 @@ async function callTool(params) {
       return textResult(await launchClient(args));
     case "minecraft_client_register":
       return textResult(await registerClient(args));
+    case "minecraft_client_attach":
+      return textResult(await attachClient(args));
+    case "minecraft_client_sequence":
+      return clientSequence(args);
     case "minecraft_client_status":
       return textResult(await clientStatus(args));
     case "minecraft_client_frame":
@@ -495,15 +587,80 @@ async function launchClient(args) {
 async function registerClient(args) {
   assertExactKeys(args, DESCRIPTOR_KEYS);
   const descriptor = await validateRegistrationDescriptor(args);
+  return registerValidatedDescriptor(descriptor);
+}
+
+async function registerValidatedDescriptor(descriptor) {
   knownSecrets.add(descriptor.token);
+  const replaced = await pruneExitedRegistrations();
   await assertDescriptorAvailable(descriptor);
   const status = await revalidateSession(descriptor);
   await saveDescriptor(descriptor);
-  return {
+  const result = {
     registered: true,
     session: publicDescriptor(descriptor),
     bridge: sanitizeForOutput(status, descriptor.token)
   };
+  if (replaced.length > 0) {
+    result.replaced_exited_registrations = replaced;
+  }
+  return result;
+}
+
+// [Arcane Academy fork] A registration whose client process has exited can never pass the identity
+// check again (a restarted client has a new process ID), so it is removed instead of blocking the
+// next registration until someone calls minecraft_client_close.
+async function pruneExitedRegistrations() {
+  const removed = [];
+  for (const descriptor of await listDescriptors()) {
+    if (!isProcessAlive(descriptor.process_id)) {
+      await removeDescriptor(descriptor.run_id);
+      removed.push(descriptor.run_id);
+    }
+  }
+  return removed;
+}
+
+// [Arcane Academy fork] Register from the game folder instead of copying five identity fields and
+// the token by hand. The bridge's status supplies the identity; the folder supplies the token, read
+// from the fixed path the mod writes. The folder must be the one the bridge reports, so a token from
+// one client cannot be used to register another.
+async function attachClient(args) {
+  assertExactKeys(args, ["runtime_root", "base_url"]);
+  const runtimeRoot = validateAbsoluteRoot(args.runtime_root, "runtime_root");
+  const baseUrl = validateLoopbackBaseUrl(args.base_url);
+  await assertNormalDirectory(runtimeRoot);
+  const tokenFile = path.win32.join(runtimeRoot, "config", "mineclient-bridge.token");
+  await assertNormalFile(tokenFile, 1, 512);
+  const token = validateToken((await fs.readFile(tokenFile, "utf8")).trim());
+  knownSecrets.add(token);
+
+  const status = await requestBridgeStatus({ base_url: baseUrl, token });
+  if (typeof status.runtime_root !== "string" ||
+      await rootComparisonKey(status.runtime_root) !== await rootComparisonKey(runtimeRoot)) {
+    throw new IdentityError(`The bridge at ${baseUrl} does not belong to ${runtimeRoot}`);
+  }
+  const descriptor = await validateRegistrationDescriptor({
+    run_id: status.run_id,
+    base_url: baseUrl,
+    token,
+    process_id: status.process_id,
+    desktop_name: status.desktop_name,
+    runtime_root: status.runtime_root,
+    evidence_root: status.evidence_root
+  });
+
+  const existing = await tryReadDescriptor(descriptor.run_id);
+  if (existing && DESCRIPTOR_KEYS.every((key) => existing[key] === descriptor[key]) &&
+      isProcessAlive(existing.process_id)) {
+    return {
+      registered: true,
+      already_registered: true,
+      session: publicDescriptor(existing),
+      bridge: sanitizeForOutput(status, token)
+    };
+  }
+  return registerValidatedDescriptor(descriptor);
 }
 
 async function clientStatus(args) {
@@ -517,24 +674,208 @@ async function clientStatus(args) {
 }
 
 async function clientFrame(args) {
-  const runId = parseRunIdOnly(args);
+  assertAllowedKeys(args, ["run_id", "save_as", "overwrite", "include_image"]);
+  const runId = validateRunId(args.run_id);
+  const options = parseFrameOptions(args, true);
   const descriptor = await readDescriptor(runId);
   await revalidateSession(descriptor);
   const frame = await requestPng(descriptor, "/control/frame");
-  return {
-    content: [
-      {
-        type: "image",
-        data: frame.toString("base64"),
-        mimeType: "image/png"
-      },
-      {
-        type: "text",
-        text: `run_id=${descriptor.run_id} process_id=${descriptor.process_id} desktop_name=${descriptor.desktop_name}`
+  const saved = options.saveAs
+    ? await saveEvidenceFrame(descriptor, options.saveAs, options.overwrite, frame)
+    : null;
+  const content = [];
+  if (options.includeImage) {
+    content.push({
+      type: "image",
+      data: frame.toString("base64"),
+      mimeType: "image/png"
+    });
+  }
+  content.push({
+    type: "text",
+    text: `run_id=${descriptor.run_id} process_id=${descriptor.process_id} desktop_name=${descriptor.desktop_name}` +
+      (saved ? ` saved=${saved} bytes=${frame.length}` : "")
+  });
+  return { content, isError: false };
+}
+
+// [Arcane Academy fork] Frame options shared by minecraft_client_frame and sequence frame steps.
+function parseFrameOptions(args, includeImageDefault) {
+  let saveAs = null;
+  if (Object.hasOwn(args, "save_as")) {
+    if (typeof args.save_as !== "string") {
+      throw new Error("save_as must be a string");
+    }
+    saveAs = args.save_as.toLowerCase().endsWith(".png") ? args.save_as : `${args.save_as}.png`;
+    if (!EVIDENCE_NAME_PATTERN.test(saveAs)) {
+      throw new Error("save_as must be 1-96 letters, digits, dots, underscores, or hyphens, starting with a letter or digit");
+    }
+  }
+  for (const key of ["overwrite", "include_image"]) {
+    if (Object.hasOwn(args, key) && typeof args[key] !== "boolean") {
+      throw new Error(`${key} must be a boolean`);
+    }
+  }
+  if (Object.hasOwn(args, "overwrite") && !saveAs) {
+    throw new Error("overwrite needs save_as");
+  }
+  const includeImage = args.include_image ?? includeImageDefault;
+  if (!includeImage && !saveAs) {
+    throw new Error("A frame needs save_as, include_image true, or both");
+  }
+  return { saveAs, overwrite: args.overwrite === true, includeImage };
+}
+
+// Writes only directly inside the registered evidence folder; the name pattern has no separators.
+async function saveEvidenceFrame(descriptor, fileName, overwrite, bytes) {
+  await assertNormalDirectory(descriptor.evidence_root);
+  const target = path.win32.join(descriptor.evidence_root, fileName);
+  if (path.win32.dirname(target) !== descriptor.evidence_root) {
+    throw new Error("save_as must name a file directly inside the evidence folder");
+  }
+  if (overwrite && await pathExists(target)) {
+    await assertNormalFile(target, 0, MAX_FRAME_BYTES);
+  }
+  try {
+    await fs.writeFile(target, bytes, { flag: overwrite ? "w" : "wx" });
+  } catch (error) {
+    if (error?.code === "EEXIST") {
+      throw new Error(`${fileName} already exists in the evidence folder; pass overwrite true to replace it`);
+    }
+    throw error;
+  }
+  return target;
+}
+
+// [Arcane Academy fork] Runs a validated list of steps with one MCP call, so a checklist step that
+// needs ten inputs and a screenshot is one round trip. Each step reuses the same parsing, identity
+// revalidation and input-isolation check as the single-step tools.
+async function clientSequence(args) {
+  assertAllowedKeys(args, ["run_id", "steps", "default_settle_ticks", "continue_on_error"]);
+  const runId = validateRunId(args.run_id);
+  if (!Array.isArray(args.steps) || args.steps.length < 1 || args.steps.length > MAX_SEQUENCE_STEPS) {
+    throw new Error(`steps must be an array of 1 to ${MAX_SEQUENCE_STEPS} steps`);
+  }
+  let defaultSettle;
+  if (Object.hasOwn(args, "default_settle_ticks")) {
+    defaultSettle = validateSettleTicks(args.default_settle_ticks, "default_settle_ticks");
+  }
+  if (Object.hasOwn(args, "continue_on_error") && typeof args.continue_on_error !== "boolean") {
+    throw new Error("continue_on_error must be a boolean");
+  }
+  const continueOnError = args.continue_on_error === true;
+
+  // Validate everything first, so a typo in step 9 cannot leave steps 1-8 half applied.
+  const plan = args.steps.map((step, index) => {
+    try {
+      return parseSequenceStep(step, runId, defaultSettle);
+    } catch (error) {
+      throw new Error(`step ${index}: ${error.message}`);
+    }
+  });
+  const totalWait = plan.reduce((sum, step) => sum + (step.type === "wait" ? step.ms : 0), 0);
+  if (totalWait > MAX_SEQUENCE_WAIT_MS) {
+    throw new Error(`wait steps add up to ${totalWait} ms; the limit is ${MAX_SEQUENCE_WAIT_MS} ms`);
+  }
+
+  const descriptor = await readDescriptor(runId);
+  const results = [];
+  const images = [];
+  for (const [index, step] of plan.entries()) {
+    try {
+      if (step.type === "wait") {
+        await delay(step.ms);
+        results.push({ index, kind: "wait", ok: true, ms: step.ms });
+        continue;
       }
-    ],
-    isError: false
+      const status = await revalidateSession(descriptor);
+      if (step.type === "input") {
+        let bridge;
+        if (step.parsed.kind === "release_all") {
+          bridge = await requestJson(descriptor, "POST", "/control/release-all", undefined);
+        } else {
+          assertInputIsolation(descriptor, status);
+          bridge = await requestJson(descriptor, "POST", step.parsed.endpoint, step.parsed.body);
+        }
+        results.push({ index, kind: step.parsed.kind, ok: true, bridge: sanitizeForOutput(bridge, descriptor.token) });
+      } else if (step.type === "frame") {
+        const frame = await requestPng(descriptor, "/control/frame");
+        const saved = step.options.saveAs
+          ? await saveEvidenceFrame(descriptor, step.options.saveAs, step.options.overwrite, frame)
+          : null;
+        if (step.options.includeImage) {
+          images.push({ type: "image", data: frame.toString("base64"), mimeType: "image/png" });
+        }
+        results.push({ index, kind: "frame", ok: true, saved, bytes: frame.length });
+      } else {
+        const result = await requestJson(descriptor, "GET", step.parsed.endpoint, undefined);
+        results.push({ index, kind: "query", query: step.parsed.kind, ok: true, result: sanitizeForOutput(result, descriptor.token) });
+      }
+    } catch (error) {
+      results.push({ index, kind: step.kind, ok: false, error: errorToText(error, descriptor.token) });
+      if (!continueOnError) {
+        break;
+      }
+    }
+  }
+
+  const failed = results.filter((entry) => !entry.ok).length;
+  const summary = {
+    run_id: descriptor.run_id,
+    process_id: descriptor.process_id,
+    steps_total: plan.length,
+    steps_run: results.length,
+    steps_failed: failed,
+    steps: results
   };
+  return {
+    content: [{ type: "text", text: JSON.stringify(summary, null, 2) }, ...images],
+    isError: failed > 0
+  };
+}
+
+function parseSequenceStep(step, runId, defaultSettle) {
+  if (!isPlainObject(step)) {
+    throw new Error("each step must be an object");
+  }
+  if (Object.hasOwn(step, "run_id")) {
+    throw new Error("steps take no run_id; the sequence's run_id applies to every step");
+  }
+  switch (step.kind) {
+    case "wait": {
+      assertExactKeys(step, ["kind", "ms"]);
+      if (!Number.isInteger(step.ms) || step.ms < 0 || step.ms > MAX_WAIT_STEP_MS) {
+        throw new Error(`wait ms must be an integer from 0 through ${MAX_WAIT_STEP_MS}`);
+      }
+      return { type: "wait", kind: "wait", ms: step.ms };
+    }
+    case "frame": {
+      assertAllowedKeys(step, ["kind", "save_as", "overwrite", "include_image"]);
+      return { type: "frame", kind: "frame", options: parseFrameOptions(step, false) };
+    }
+    case "query": {
+      const { kind: _kind, query, ...rest } = step;
+      if (typeof query !== "string") {
+        throw new Error("query steps need query: capabilities, state, screen, keymaps, or chat");
+      }
+      return { type: "query", kind: "query", parsed: parseQuery({ run_id: runId, kind: query, ...rest }) };
+    }
+    default: {
+      const withSettle = defaultSettle !== undefined && step.kind !== "release_all" &&
+        !Object.hasOwn(step, "settle_ticks")
+        ? { ...step, settle_ticks: defaultSettle }
+        : step;
+      const parsed = parseInput({ run_id: runId, ...withSettle });
+      return { type: "input", kind: parsed.kind, parsed };
+    }
+  }
+}
+
+function validateSettleTicks(value, label = "settle_ticks") {
+  if (!Number.isInteger(value) || value < 0 || value > MAX_SETTLE_TICKS) {
+    throw new Error(`${label} must be an integer from 0 through ${MAX_SETTLE_TICKS}`);
+  }
+  return value;
 }
 
 async function clientQuery(args) {
@@ -639,7 +980,22 @@ function parseRunIdOnly(args) {
   return validateRunId(args.run_id);
 }
 
+// [Arcane Academy fork] settle_ticks is accepted on every input kind except release_all and passed
+// to the bridge, which answers once that many client ticks have finished after the input.
 function parseInput(args) {
+  if (!Object.hasOwn(args, "settle_ticks")) {
+    return parseInputKind(args);
+  }
+  const { settle_ticks: settleTicks, ...rest } = args;
+  const parsed = parseInputKind(rest);
+  if (parsed.kind === "release_all") {
+    throw new Error("settle_ticks is not valid for release_all");
+  }
+  parsed.body.settle_ticks = validateSettleTicks(settleTicks);
+  return parsed;
+}
+
+function parseInputKind(args) {
   if (typeof args.kind !== "string") {
     throw new Error("kind must be one of key, raw_key, look, mouse, text, command, release_all");
   }
@@ -794,8 +1150,19 @@ function parseQuery(args) {
       }
       return { runId, kind: args.kind, endpoint: `/control/state?radius=${args.radius}` };
     }
+    case "chat": {
+      // [Arcane Academy fork] Recent chat lines and the action-bar message.
+      assertAllowedKeys(args, ["run_id", "kind", "limit"]);
+      if (!Object.hasOwn(args, "limit")) {
+        return { runId, kind: args.kind, endpoint: "/control/chat" };
+      }
+      if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > MAX_CHAT_MESSAGES) {
+        throw new Error(`chat limit must be an integer from 1 through ${MAX_CHAT_MESSAGES}`);
+      }
+      return { runId, kind: args.kind, endpoint: `/control/chat?limit=${args.limit}` };
+    }
     default:
-      throw new Error("query kind must be capabilities, state, screen, or keymaps");
+      throw new Error("query kind must be capabilities, state, screen, keymaps, or chat");
   }
 }
 
@@ -1473,10 +1840,21 @@ async function bridgeFetch(connection, method, endpoint, body, timeoutMs) {
       signal: controller.signal
     });
     if (!response.ok) {
-      if (response.body) {
-        await response.body.cancel().catch(() => {});
+      // [Arcane Academy fork] Keep the bridge's error code (for example not_in_world), so a
+      // failed step says why. Only the bounded code string is used, never the raw body.
+      let code = "";
+      try {
+        const bytes = await readResponseLimited(response, MAX_ERROR_BODY_BYTES);
+        const parsed = JSON.parse(bytes.toString("utf8"));
+        if (typeof parsed?.error === "string" && /^[a-z0-9_]{1,64}$/.test(parsed.error)) {
+          code = ` (${parsed.error})`;
+        }
+      } catch {
+        if (response.body) {
+          await response.body.cancel().catch(() => {});
+        }
       }
-      throw new Error(`Bridge HTTP ${response.status} for ${endpoint}`);
+      throw new Error(`Bridge HTTP ${response.status} for ${endpoint}${code}`);
     }
     return { response, cleanup: () => clearTimeout(timer) };
   } catch (error) {

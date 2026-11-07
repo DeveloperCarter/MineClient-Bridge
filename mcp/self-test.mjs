@@ -107,17 +107,19 @@ async function runSelfTest() {
       clientInfo: { name: "mineclient-bridge-self-test", version: "1.1.8" }
     });
     assert.equal(initialized.result.serverInfo.name, "mineclient-bridge");
-    assert.equal(initialized.result.serverInfo.version, "1.1.8");
+    assert.equal(initialized.result.serverInfo.version, "1.1.8-aa.1");
 
     const listed = await client.request("tools/list", {});
     const toolNames = listed.result.tools.map((tool) => tool.name);
     assert.deepEqual(toolNames, [
       "minecraft_client_launch",
       "minecraft_client_register",
+      "minecraft_client_attach",
       "minecraft_client_status",
       "minecraft_client_frame",
       "minecraft_client_query",
       "minecraft_client_input",
+      "minecraft_client_sequence",
       "minecraft_client_close"
     ]);
     for (const tool of listed.result.tools) {
@@ -141,6 +143,7 @@ async function runSelfTest() {
     const queryTool = listed.result.tools.find((tool) => tool.name === "minecraft_client_query");
     assert.deepEqual([...queryTool.inputSchema.properties.kind.enum].sort(), [
       "capabilities",
+      "chat",
       "keymaps",
       "screen",
       "state"

@@ -15,10 +15,12 @@ const MAX_LINE_BYTES = 1024 * 1024;
 const TOOL_NAMES = [
   "minecraft_client_launch",
   "minecraft_client_register",
+  "minecraft_client_attach",
   "minecraft_client_status",
   "minecraft_client_frame",
   "minecraft_client_query",
   "minecraft_client_input",
+  "minecraft_client_sequence",
   "minecraft_client_close"
 ];
 
@@ -102,7 +104,7 @@ async function runServer({ input = "", script, expectedExit = 0 }) {
   }
 }
 
-test("stdio initialize and coalesced tools/list expose the seven standard tools", async () => {
+test("stdio initialize and coalesced tools/list expose the standard tools", async () => {
   const messages = await runServer({
     input: line(request(1, "initialize", {
       protocolVersion: "2024-11-05",
@@ -113,7 +115,7 @@ test("stdio initialize and coalesced tools/list expose the seven standard tools"
   });
   assert.equal(messages.length, 2, "Notifications must not produce a response");
   assert.deepEqual(messages.map((message) => message.id), [1, 2]);
-  assert.deepEqual(messages[0].result.serverInfo, { name: "mineclient-bridge", version: "1.1.8" });
+  assert.deepEqual(messages[0].result.serverInfo, { name: "mineclient-bridge", version: "1.1.8-aa.1" });
   assert.deepEqual(messages[1].result.tools.map((tool) => tool.name), TOOL_NAMES);
 });
 
