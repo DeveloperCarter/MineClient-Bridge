@@ -107,7 +107,7 @@ async function runSelfTest() {
       clientInfo: { name: "mineclient-bridge-self-test", version: "1.1.8" }
     });
     assert.equal(initialized.result.serverInfo.name, "mineclient-bridge");
-    assert.equal(initialized.result.serverInfo.version, "1.1.8-aa.2");
+    assert.equal(initialized.result.serverInfo.version, "1.1.8-aa.3");
 
     const listed = await client.request("tools/list", {});
     const toolNames = listed.result.tools.map((tool) => tool.name);
