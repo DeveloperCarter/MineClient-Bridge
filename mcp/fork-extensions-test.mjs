@@ -227,6 +227,18 @@ try {
   await expectError("minecraft_client_query", { run_id: runId, kind: "probe", name: "Bad Name" }, /probe name/);
   const particles = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "particles" }));
   assert.equal(particles.result.by_class["dev.example.Spark"], 2);
+  const sounds = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "sounds" }));
+  assert.equal(sounds.result.sounds[0].volume, 0.08);
+  assert.equal(sounds.result.sounds[0].pitch, 0.55);
+  await expectError("minecraft_client_query", { run_id: runId, kind: "sounds", name: "unexpected" }, /arguments/);
+  const soundSequence = JSON.parse((await client.callTool("minecraft_client_sequence", { run_id: runId,
+    steps: [{ kind: "query", query: "sounds" }] })).content[0].text);
+  assert.equal(soundSequence.steps[0].result.sounds[0].effective_volume, 0.04);
+  bridge.journal.push({ seq: 2, type: "client_feedback", data: { text: "[probe] client.player {}" } });
+  const feedback = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "journal", since: 1, types: ["client_feedback"] }));
+  assert.equal(feedback.result.events[0].data.text, "[probe] client.player {}");
+  bridge.journal.pop();
+
 
   // wait_for: a probe value that changes on the third read, a chat line that only arrives after the wait
   // starts (the old matching line must not count), a screen, and a timeout that reports the last value.
@@ -330,6 +342,9 @@ async function createFixtureBridge(identity) {
       state.probeReads = (state.probeReads ?? 0) + 1;
       return json(response, 200, { ok: true, owner: "arcaneacademy",
         result: { probe: url.searchParams.get("name"), ok: true, value: { current: state.probeReads >= 3 ? 95 : 100 } } });
+    }
+    if (url.pathname === "/control/sounds") {
+      return json(response, 200, { ok: true, sounds: [{ instance: 1, sound: "minecraft:block.beacon.ambient", volume: 0.08, pitch: 0.55, source_volume: 0.5, effective_volume: 0.04 }] });
     }
     if (url.pathname === "/control/particles") {
       return json(response, 200, { ok: true, total: 2, by_class: { "dev.example.Spark": 2 } });

@@ -139,6 +139,7 @@ public final class BridgeServer {
             createdServer.createContext("/control/journal", BridgeServer::handleControlJournal);
             createdServer.createContext("/control/probe", BridgeServer::handleControlProbe);
             createdServer.createContext("/control/particles", BridgeServer::handleControlParticles);
+            createdServer.createContext("/control/sounds", BridgeServer::handleControlSounds);
             createdServer.createContext("/", BridgeServer::handleRoot);
 
             createdExecutor = Executors.newFixedThreadPool(HTTP_WORKERS, workerThreadFactory());
@@ -649,6 +650,7 @@ public final class BridgeServer {
         addOperation(operations, "GET", "/control/journal", "event_journal");
         addOperation(operations, "GET", "/control/probe", "mod_probe");
         addOperation(operations, "GET", "/control/particles", "particle_counts");
+        addOperation(operations, "GET", "/control/sounds", "looping_sound_values");
         obj.add("operations", operations);
 
         JsonObject limits = new JsonObject();
@@ -1254,6 +1256,16 @@ public final class BridgeServer {
             respondJson(exchange, 200, callOnMinecraftThread(ParticleSnapshot::create, MINECRAFT_TIMEOUT_SECONDS));
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "particles_failed", e);
+        }
+    }
+
+    // [Arcane Academy fork] Read active loop values on the client thread, alongside journal samples.
+    private static void handleControlSounds(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/sounds", "GET")) return;
+        try {
+            respondJson(exchange, 200, callOnMinecraftThread(LoopingSounds::snapshot, MINECRAFT_TIMEOUT_SECONDS));
+        } catch (Exception e) {
+            respondMinecraftFailure(exchange, "sounds_failed", e);
         }
     }
 

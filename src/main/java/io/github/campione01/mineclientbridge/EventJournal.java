@@ -23,7 +23,7 @@ import net.neoforged.neoforge.common.NeoForge;
  * {@code since} to the next, so nothing is read twice and nothing in between is missed. When more
  * than {@link #CAPACITY} events arrive between reads the oldest are dropped and counted.</p>
  *
- * <p>Only NeoForge events are used, no mixins. Recording is thread-safe: game events arrive on
+ * <p>NeoForge events and bounded read-only polling are used, with no mixins. Recording is thread-safe: game events arrive on
  * the client thread, mod events on whichever thread produced them, reads on HTTP workers.</p>
  */
 final class EventJournal {
@@ -34,6 +34,8 @@ final class EventJournal {
     private static final ArrayDeque<JsonObject> EVENTS = new ArrayDeque<>();
     private static long nextSequence = 1;
     private static long dropped;
+    private static final ChatFeedbackTracker FEEDBACK = new ChatFeedbackTracker();
+    private static Object lastChatHead;
     // The game tick for each event. A supplier, so unit tests can record without a Minecraft instance.
     static java.util.function.LongSupplier tickSource = () -> {
         Minecraft mc = Minecraft.getInstance();
@@ -44,10 +46,11 @@ final class EventJournal {
     }
 
     static void install() {
-        NeoForge.EVENT_BUS.addListener((ClientChatReceivedEvent event) -> {
+        NeoForge.EVENT_BUS.addListener(net.neoforged.bus.api.EventPriority.LOWEST, (ClientChatReceivedEvent event) -> {
             JsonObject data = new JsonObject();
             data.addProperty("text", bounded(event.getMessage().getString()));
             boolean overlay = event instanceof ClientChatReceivedEvent.System system && system.isOverlay();
+            if (!overlay) FEEDBACK.received(event.getMessage());
             String type = overlay ? "action_bar" : event.isSystem() ? "system_chat" : "chat";
             record(type, data);
         });
@@ -65,6 +68,7 @@ final class EventJournal {
         NeoForge.EVENT_BUS.addListener((PlaySoundEvent event) -> {
             SoundInstance sound = event.getSound();
             if (sound == null) return;
+            LoopingSounds.started(sound);
             JsonObject data = new JsonObject();
             data.addProperty("sound", sound.getLocation().toString());
             data.addProperty("source", sound.getSource().getName());
@@ -80,6 +84,31 @@ final class EventJournal {
             data.addProperty("pos", String.format(java.util.Locale.ROOT, "%.1f %.1f %.1f", sound.getX(), sound.getY(), sound.getZ()));
             record("sound", data);
         });
+        NeoForge.EVENT_BUS.addListener((net.neoforged.neoforge.client.event.ClientTickEvent.Post event) -> {
+            clientFeedback();
+            LoopingSounds.tick();
+        });
+        NeoForge.EVENT_BUS.addListener((net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent.LoggingOut event) -> {
+            FEEDBACK.clear(); lastChatHead = null; LoopingSounds.clear();
+        });
+    }
+
+    private static void clientFeedback() {
+        var messages = Minecraft.getInstance().gui.getChat().allMessages;
+        Object head = messages.isEmpty() ? null : messages.getFirst();
+        if (head == lastChatHead) return;
+        lastChatHead = head;
+        // NeoForge client commands call ChatComponent directly, bypassing ClientChatReceivedEvent.
+        // The existing read-only AT exposes these lines. Identity avoids duplicating ordinary chat
+        // while retaining repeated identical local replies as separate chronological events.
+        for (int index = Math.min(100, messages.size()) - 1; index >= 0; index--) {
+            var line = messages.get(index);
+            if (!FEEDBACK.local(line, line.content())) continue;
+            var data = new JsonObject();
+            data.addProperty("text", bounded(line.content().getString()));
+            data.addProperty("truncated", line.content().getString().length() > MAX_TEXT);
+            record("client_feedback", data);
+        }
     }
 
     static void record(String type, JsonObject data) {

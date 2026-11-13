@@ -179,10 +179,10 @@ const tools = [
         run_id: { type: "string" },
         kind: {
           type: "string",
-          enum: ["capabilities", "screen", "keymaps", "state", "chat", "journal", "probe", "particles"],
+          enum: ["capabilities", "screen", "keymaps", "state", "chat", "journal", "probe", "particles", "sounds"],
           description: "View to read. Only state accepts radius; chat and journal accept limit. chat returns recent chat lines (newest first) and the action-bar message. " +
             "journal returns client events after the cursor since (chat, action_bar, screen_open/close, sound, bridge_input, and development-mod events), with next to pass as since next time. " +
-            "probe returns a development mod's named JSON probe (name 'list' lists them). particles counts live particles by class."
+            "probe returns a development mod's named JSON probe (name 'list' lists them). particles counts live particles by class. sounds returns active looping volume, pitch and source/master gain, also journaled as looping_sound. Local feedback appears as client_feedback."
         },
         since: { type: "integer", minimum: 0, description: "Journal cursor: the next value of the previous journal read. Default 0." },
         types: { type: "array", items: { type: "string" }, maxItems: 16, description: "Journal event types to return; others are skipped." },
@@ -1011,7 +1011,7 @@ function parseSequenceStep(step, runId, defaultSettle) {
     case "query": {
       const { kind: _kind, query, ...rest } = step;
       if (typeof query !== "string") {
-        throw new Error("query steps need query: capabilities, state, screen, keymaps, chat, journal, probe, or particles");
+        throw new Error("query steps need query: capabilities, state, screen, keymaps, chat, journal, probe, particles, or sounds");
       }
       return { type: "query", kind: "query", parsed: parseQuery({ run_id: runId, kind: query, ...rest }) };
     }
@@ -1360,10 +1360,11 @@ function parseQuery(args) {
       return { runId, kind: args.kind, endpoint: `/control/probe?name=${encodeURIComponent(name)}` };
     }
     case "particles":
+    case "sounds":
       assertExactKeys(args, ["run_id", "kind"]);
-      return { runId, kind: args.kind, endpoint: "/control/particles" };
+      return { runId, kind: args.kind, endpoint: `/control/${args.kind}` };
     default:
-      throw new Error("query kind must be capabilities, state, screen, keymaps, chat, journal, probe, or particles");
+      throw new Error("query kind must be capabilities, state, screen, keymaps, chat, journal, probe, particles, or sounds");
   }
 }
 

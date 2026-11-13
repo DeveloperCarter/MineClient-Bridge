@@ -152,6 +152,7 @@ async function runSelfTest() {
       "particles",
       "probe",
       "screen",
+      "sounds",
       "state"
     ]);
 

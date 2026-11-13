@@ -62,3 +62,8 @@ Resolve conflicts (most likely in `BridgeServer.java`, the tests that pin upstre
 ## Contributing back
 
 The scroll path and the MCP additions are useful to anyone. If Carter decides to offer them upstream, open pull requests from topic branches based on upstream `main`, one change per pull request.
+
+
+## Unreleased observability-2 work, 13 November 2026
+
+T073 lives on observability-2, based on arcane7175bcf. Client-command feedback and looping sound samples are local build features. Keep the aa.3 version and wizard pin until Carter approves a release. Use the local jar override and fresh private MCP connections from the scenario runner for verification. The parked/focus-hints branch remains parked. The regular NeoForge early window is retained. Publication is a separate decision.
