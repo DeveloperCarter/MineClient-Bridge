@@ -135,6 +135,10 @@ public final class BridgeServer {
             // [Arcane Academy fork] Development resource reload, equivalent to F3+T.
             createdServer.createContext("/control/reload-resources", BridgeServer::handleReloadResources);
             createdServer.createContext("/control/hotswap", BridgeServer::handleHotswap);
+            // [Arcane Academy fork] Text observation for agents: journal, mod probes, particles.
+            createdServer.createContext("/control/journal", BridgeServer::handleControlJournal);
+            createdServer.createContext("/control/probe", BridgeServer::handleControlProbe);
+            createdServer.createContext("/control/particles", BridgeServer::handleControlParticles);
             createdServer.createContext("/", BridgeServer::handleRoot);
 
             createdExecutor = Executors.newFixedThreadPool(HTTP_WORKERS, workerThreadFactory());
@@ -252,11 +256,20 @@ public final class BridgeServer {
     private static void handleControlFrame(HttpExchange exchange) throws IOException {
         if (!requireControlAccess(exchange, "/control/frame", "GET")) return;
 
+        // [Arcane Academy fork] Optional crop (GUI-scaled x, y, w, h) and downscale; see FrameShaper.
+        final FrameShaper.Options options;
         try {
-            byte[] png = callOnMinecraftThread(
-                    BridgeServer::captureFrame,
+            options = frameOptions(exchange);
+        } catch (RequestException e) {
+            respondRequestFailure(exchange, e);
+            return;
+        }
+        try {
+            FrameShaper.Shaped shaped = callOnMinecraftThread(
+                    () -> captureFrame(options),
                     FRAME_TIMEOUT_SECONDS);
-            respondBytes(exchange, 200, "image/png", png);
+            exchange.getResponseHeaders().set("X-MineClient-Frame", GSON.toJson(shaped.meta()));
+            respondBytes(exchange, 200, "image/png", shaped.png());
         } catch (Exception e) {
             respondMinecraftFailure(exchange, "frame_capture_failed", e);
         }
@@ -633,6 +646,9 @@ public final class BridgeServer {
         addOperation(operations, "POST", "/control/close", "graceful_client_stop");
         addOperation(operations, "POST", "/control/reload-resources", "resource_reload");
         addOperation(operations, "POST", "/control/hotswap", "development_class_redefinition");
+        addOperation(operations, "GET", "/control/journal", "event_journal");
+        addOperation(operations, "GET", "/control/probe", "mod_probe");
+        addOperation(operations, "GET", "/control/particles", "particle_counts");
         obj.add("operations", operations);
 
         JsonObject limits = new JsonObject();
@@ -650,6 +666,9 @@ public final class BridgeServer {
         limits.addProperty("command_characters_max", MAX_COMMAND_LENGTH);
         limits.addProperty("settle_ticks_max", TickClock.MAX_SETTLE_TICKS);
         limits.addProperty("chat_messages_max", ChatSnapshot.MAX_MESSAGES);
+        limits.addProperty("journal_capacity", EventJournal.CAPACITY);
+        limits.addProperty("journal_read_max", EventJournal.MAX_READ);
+        obj.addProperty("mod_probes", ModLink.linked());
         obj.add("limits", limits);
         obj.addProperty("tick_clock", TickClock.installed());
 
@@ -1141,18 +1160,100 @@ public final class BridgeServer {
         parent.add(name, entry);
     }
 
-    private static byte[] captureFrame() throws IOException {
+    private static FrameShaper.Shaped captureFrame(FrameShaper.Options options) throws IOException {
         Minecraft mc = Minecraft.getInstance();
         if (mc.getMainRenderTarget() == null) {
             throw new IOException("Minecraft main render target is unavailable");
         }
 
         try (NativeImage image = Screenshot.takeScreenshot(mc.getMainRenderTarget())) {
-            byte[] png = image.asByteArray();
-            if (png.length > MAX_FRAME_BYTES) {
-                throw new FrameTooLargeException(png.length);
+            FrameShaper.Shaped shaped = FrameShaper.shape(image, options, mc.getWindow().getGuiScale());
+            if (shaped.png().length > MAX_FRAME_BYTES) {
+                throw new FrameTooLargeException(shaped.png().length);
             }
-            return png;
+            return shaped;
+        }
+    }
+
+    // [Arcane Academy fork] scale (0.1-1), and a region given as all of x, y, w, h or none of them.
+    private static FrameShaper.Options frameOptions(HttpExchange exchange) throws RequestException {
+        double scale = queryDouble(exchange, "scale", 1.0, 0.1, 1.0);
+        String x = rawQueryValue(exchange, "x");
+        String y = rawQueryValue(exchange, "y");
+        String w = rawQueryValue(exchange, "w");
+        String h = rawQueryValue(exchange, "h");
+        boolean any = x != null || y != null || w != null || h != null;
+        if (!any) {
+            return new FrameShaper.Options(scale, 0, 0, 0, 0, false);
+        }
+        if (x == null || y == null || w == null || h == null) {
+            throw new RequestException(400, "invalid_region", "a region needs all of x, y, w and h");
+        }
+        return new FrameShaper.Options(scale,
+                (int) queryDouble(exchange, "x", 0, 0, MAX_GUI_COORDINATE),
+                (int) queryDouble(exchange, "y", 0, 0, MAX_GUI_COORDINATE),
+                (int) queryDouble(exchange, "w", 1, 1, MAX_GUI_COORDINATE),
+                (int) queryDouble(exchange, "h", 1, 1, MAX_GUI_COORDINATE),
+                true);
+    }
+
+    // [Arcane Academy fork] Journal events after a cursor; see EventJournal.
+    private static void handleControlJournal(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/journal", "GET")) return;
+        try {
+            long since = (long) queryDouble(exchange, "since", 0, 0, 9.0e15);
+            int limit = (int) queryDouble(exchange, "limit", 200, 1, EventJournal.MAX_READ);
+            java.util.Set<String> types = new java.util.HashSet<>();
+            for (String type : queryString(exchange, "types", "").split(",")) {
+                if (!type.isBlank()) types.add(type.trim());
+            }
+            respondJson(exchange, 200, EventJournal.read(since, types, limit));
+        } catch (RequestException e) {
+            respondRequestFailure(exchange, e);
+        }
+    }
+
+    // [Arcane Academy fork] A development mod's probe, read on this worker thread; see ModLink.
+    private static void handleControlProbe(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/probe", "GET")) return;
+        final String name;
+        try {
+            name = queryString(exchange, "name", "list");
+            if (!name.matches("[a-z0-9_.:-]{1,64}")) {
+                throw new RequestException(400, "invalid_name", "name must be 1-64 of a-z 0-9 _ . : -");
+            }
+        } catch (RequestException e) {
+            respondRequestFailure(exchange, e);
+            return;
+        }
+        final String json;
+        try {
+            json = ModLink.readProbe(name);
+        } catch (RuntimeException e) {
+            respondJson(exchange, 500, error("probe_failed", e.getClass().getSimpleName()));
+            return;
+        }
+        if (json == null) {
+            respondJson(exchange, 404, error("no_probe_reader", "No development mod registered a probe_reader"));
+            return;
+        }
+        JsonObject obj = ok();
+        obj.addProperty("owner", ModLink.probeOwner());
+        try {
+            obj.add("result", com.google.gson.JsonParser.parseString(json));
+        } catch (RuntimeException e) {
+            obj.addProperty("result_text", json.length() > 4096 ? json.substring(0, 4096) : json);
+        }
+        respondJson(exchange, 200, obj);
+    }
+
+    // [Arcane Academy fork] Live particles by class; see ParticleSnapshot.
+    private static void handleControlParticles(HttpExchange exchange) throws IOException {
+        if (!requireControlAccess(exchange, "/control/particles", "GET")) return;
+        try {
+            respondJson(exchange, 200, callOnMinecraftThread(ParticleSnapshot::create, MINECRAFT_TIMEOUT_SECONDS));
+        } catch (Exception e) {
+            respondMinecraftFailure(exchange, "particles_failed", e);
         }
     }
 
@@ -1708,7 +1809,15 @@ public final class BridgeServer {
             respondJson(exchange, 401, error("unauthorized"));
             return false;
         }
-        return requireMethod(exchange, method);
+        if (!requireMethod(exchange, method)) return false;
+        // [Arcane Academy fork] Bridge-driven inputs go into the journal, so their order against
+        // the game's own events (chat, screens, sounds) is visible afterwards.
+        if ("POST".equals(method)) {
+            JsonObject data = new JsonObject();
+            data.addProperty("endpoint", path);
+            EventJournal.record("bridge_input", data);
+        }
+        return true;
     }
 
     private static boolean requireMethod(HttpExchange exchange, String method) throws IOException {
@@ -1917,14 +2026,41 @@ public final class BridgeServer {
         return (int) number;
     }
 
+    // [Arcane Academy fork] A bounded text query value, with the same duplicate and encoding rules.
+    private static String queryString(HttpExchange exchange, String key, String fallback) throws RequestException {
+        String found = rawQueryValue(exchange, key);
+        if (found == null) return fallback;
+        if (found.length() > 256) {
+            throw new RequestException(400, "invalid_" + key, key + " must be at most 256 characters");
+        }
+        return found;
+    }
+
     private static double queryDouble(
             HttpExchange exchange,
             String key,
             double fallback,
             double minimum,
             double maximum) throws RequestException {
+        String found = rawQueryValue(exchange, key);
+        if (found == null) return fallback;
+
+        final double value;
+        try {
+            value = Double.parseDouble(found);
+        } catch (NumberFormatException e) {
+            throw new RequestException(400, "invalid_" + key, key + " must be a number");
+        }
+        if (!Double.isFinite(value) || value < minimum || value > maximum) {
+            throw new RequestException(400, "invalid_" + key,
+                    key + " must be between " + minimum + " and " + maximum);
+        }
+        return value;
+    }
+
+    private static String rawQueryValue(HttpExchange exchange, String key) throws RequestException {
         String rawQuery = exchange.getRequestURI().getRawQuery();
-        if (rawQuery == null || rawQuery.isBlank()) return fallback;
+        if (rawQuery == null || rawQuery.isBlank()) return null;
 
         String found = null;
         try {
@@ -1943,19 +2079,7 @@ public final class BridgeServer {
         } catch (IllegalArgumentException e) {
             throw new RequestException(400, "invalid_query", "Query string encoding is invalid");
         }
-        if (found == null) return fallback;
-
-        final double value;
-        try {
-            value = Double.parseDouble(found);
-        } catch (NumberFormatException e) {
-            throw new RequestException(400, "invalid_" + key, key + " must be a number");
-        }
-        if (!Double.isFinite(value) || value < minimum || value > maximum) {
-            throw new RequestException(400, "invalid_" + key,
-                    key + " must be between " + minimum + " and " + maximum);
-        }
-        return value;
+        return found;
     }
 
     private static void validateScreenText(String text) throws RequestException {

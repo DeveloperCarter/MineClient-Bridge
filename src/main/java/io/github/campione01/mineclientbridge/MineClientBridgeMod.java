@@ -13,6 +13,9 @@ public final class MineClientBridgeMod {
     public MineClientBridgeMod(IEventBus modEventBus) {
         InputEventProbe.install();
         TickClock.install();
+        // [Arcane Academy fork] Text observation for agents: event journal and development-mod probes.
+        EventJournal.install();
+        ModLink.install(modEventBus);
         BridgeServer.start();
         Runtime.getRuntime().addShutdownHook(new Thread(
                 BridgeServer::stop,

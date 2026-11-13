@@ -209,7 +209,63 @@ try {
   assert.equal(isolatedSwap.isError, true);
   bridge.isolation = INPUT_ISOLATION;
 
-  console.log("FORK_EXTENSIONS_TEST_OK attach=folder frame=saved chat=query settle=passthrough sequence=ordered stale=replaced errors=coded reload=duration-error hotswap=report-agent-error");
+  // Frames: scale and region reach the bridge as a query; the bridge's frame summary comes back as text.
+  const scaled = await client.callTool("minecraft_client_frame", { run_id: runId, save_as: "scaled", include_image: false, scale: 0.5, region: { x: 0, y: 0, w: 100, h: 50 } });
+  assert.match(scaled.content.find((block) => block.type === "text").text, /changed_fraction/);
+  assert(bridge.requests.some((entry) => entry.path === "/control/frame?scale=0.5&x=0&y=0&w=100&h=50"));
+  await expectError("minecraft_client_frame", { run_id: runId, include_image: true, scale: 2 }, /scale/);
+  await expectError("minecraft_client_frame", { run_id: runId, include_image: true, region: { x: 0, y: 0, w: 0, h: 5 } }, /region.w/);
+
+  // Journal, probe and particle queries.
+  bridge.journal.push({ seq: 1, type: "chat", data: { text: "old line" } });
+  const journal = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "journal", since: 0, types: ["chat"], limit: 10 }));
+  assert.equal(journal.result.events[0].data.text, "old line");
+  assert(bridge.requests.some((entry) => entry.path === "/control/journal?since=0&limit=10&types=chat"));
+  await expectError("minecraft_client_query", { run_id: runId, kind: "journal", limit: 501 }, /limit/);
+  const probe = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "probe", name: "mana" }));
+  assert.equal(probe.result.result.probe, "mana");
+  await expectError("minecraft_client_query", { run_id: runId, kind: "probe", name: "Bad Name" }, /probe name/);
+  const particles = payload(await client.callTool("minecraft_client_query", { run_id: runId, kind: "particles" }));
+  assert.equal(particles.result.by_class["dev.example.Spark"], 2);
+
+  // wait_for: a probe value that changes on the third read, a chat line that only arrives after the wait
+  // starts (the old matching line must not count), a screen, and a timeout that reports the last value.
+  bridge.probeReads = 0;
+  const waited = JSON.parse((await client.callTool("minecraft_client_wait_for", { run_id: runId, condition: { probe: "mana", path: "current", op: "lt", value: 100 }, timeout_ms: 2000, interval_ms: 50 })).content[0].text);
+  assert.equal(waited.met, true);
+  assert.equal(waited.value, 95);
+  assert(waited.polls >= 3);
+  setTimeout(() => bridge.journal.push({ seq: 2, type: "system_chat", data: { text: "[probe] mana {}" } }), 150);
+  const chatWait = JSON.parse((await client.callTool("minecraft_client_wait_for", { run_id: runId, condition: { chat: "^\\[probe\\] mana" }, timeout_ms: 2000, interval_ms: 50 })).content[0].text);
+  assert.equal(chatWait.met, true);
+  assert.equal(chatWait.value.seq, 2);
+  const oldOnly = await client.callTool("minecraft_client_wait_for", { run_id: runId, condition: { chat: "old line" }, timeout_ms: 200, interval_ms: 50 });
+  assert.equal(oldOnly.isError, true, "a line from before the wait does not count");
+  bridge.screenOpen = true;
+  const screenWait = JSON.parse((await client.callTool("minecraft_client_wait_for", { run_id: runId, condition: { screen: "LoadoutScreen" }, timeout_ms: 500 })).content[0].text);
+  assert.equal(screenWait.value.class, "dev.example.LoadoutScreen");
+  const timedOut = await client.callTool("minecraft_client_wait_for", { run_id: runId, condition: { screen: "none" }, timeout_ms: 150, interval_ms: 50 });
+  assert.equal(timedOut.isError, true);
+  assert.match(timedOut.content[0].text, /timed out/);
+  bridge.screenOpen = false;
+  await expectError("minecraft_client_wait_for", { run_id: runId, condition: { screen: "x", chat: "y" } }, /exactly one/);
+  await expectError("minecraft_client_wait_for", { run_id: runId, condition: { state: "player.health", op: "near" } }, /op must be/);
+  await expectError("minecraft_client_wait_for", { run_id: runId, condition: { screen: "none" }, timeout_ms: 30001 }, /timeout_ms/);
+  const sequenceWait = JSON.parse((await client.callTool("minecraft_client_sequence", { run_id: runId, steps: [{ kind: "wait_for", condition: { screen: "none" }, timeout_ms: 500 }, { kind: "query", query: "particles" }] })).content[0].text);
+  assert.equal(sequenceWait.steps_run, 2);
+  assert.equal(sequenceWait.steps[0].met, true);
+
+  // Telemetry: the check label is stripped before the tool runs and each call adds one line.
+  await client.callTool("minecraft_client_query", { run_id: runId, kind: "particles", check: "fork-telemetry" });
+  const telemetry = (await fs.readFile(path.join(evidenceRoot, "telemetry.jsonl"), "utf8")).trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  const labelled = telemetry.find((line) => line.check === "fork-telemetry");
+  assert.equal(labelled.tool, "query");
+  assert.equal(labelled.ok, true);
+  assert(labelled.text_chars > 0);
+  assert(telemetry.some((line) => line.tool === "frame" && line.frames === 1));
+  await expectError("minecraft_client_query", { run_id: runId, kind: "particles", check: "bad label!" }, /check must/);
+
+  console.log("FORK_EXTENSIONS_TEST_OK journal=cursor probe=query wait_for=probe-chat-screen-timeout frame=scale-region telemetry=jsonl attach=folder frame=saved chat=query settle=passthrough sequence=ordered stale=replaced errors=coded reload=duration-error hotswap=report-agent-error");
 } finally {
   await client?.end().catch(() => client?.kill());
   await bridge?.close();
@@ -244,7 +300,7 @@ async function exitedProcessId() {
 }
 
 async function createFixtureBridge(identity) {
-  const state = { requests: [], isolation: INPUT_ISOLATION };
+  const state = { requests: [], isolation: INPUT_ISOLATION, journal: [] };
   const server = http.createServer(async (request, response) => {
     if (request.headers.authorization !== `Bearer ${token}`) {
       return json(response, 401, { error: "unauthorized" });
@@ -259,8 +315,27 @@ async function createFixtureBridge(identity) {
       return json(response, 200, { ...identity, input_isolation: state.isolation, token_echo: token });
     }
     if (url.pathname === "/control/frame") {
-      response.writeHead(200, { "content-type": "image/png", "content-length": PNG.length });
+      response.writeHead(200, { "content-type": "image/png", "content-length": PNG.length,
+        "x-mineclient-frame": JSON.stringify({ width: 1, height: 1, changed_fraction: 0.25 }) });
       return response.end(PNG);
+    }
+    if (url.pathname === "/control/journal") {
+      const since = Number(url.searchParams.get("since") ?? 0);
+      const types = (url.searchParams.get("types") ?? "").split(",").filter(Boolean);
+      const events = state.journal.filter((event) => event.seq > since && (!types.length || types.includes(event.type)));
+      const newest = state.journal.length ? state.journal[state.journal.length - 1].seq : 0;
+      return json(response, 200, { ok: true, events, next: Math.max(Math.min(since, newest), newest), more: false, missed: 0, dropped_total: 0 });
+    }
+    if (url.pathname === "/control/probe") {
+      state.probeReads = (state.probeReads ?? 0) + 1;
+      return json(response, 200, { ok: true, owner: "arcaneacademy",
+        result: { probe: url.searchParams.get("name"), ok: true, value: { current: state.probeReads >= 3 ? 95 : 100 } } });
+    }
+    if (url.pathname === "/control/particles") {
+      return json(response, 200, { ok: true, total: 2, by_class: { "dev.example.Spark": 2 } });
+    }
+    if (url.pathname === "/control/screen") {
+      return json(response, 200, state.screenOpen ? { ok: true, open: true, class: "dev.example.LoadoutScreen", title: "Loadout" } : { ok: true, open: false });
     }
     if (url.pathname === "/control/chat") {
       return json(response, 200, { ok: true, action_bar: { showing: false }, messages: [{ text: "fixture line", added_tick: 1 }] });

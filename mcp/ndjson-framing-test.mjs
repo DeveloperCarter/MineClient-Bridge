@@ -21,6 +21,7 @@ const TOOL_NAMES = [
   "minecraft_client_query",
   "minecraft_client_input",
   "minecraft_client_sequence",
+  "minecraft_client_wait_for",
   "minecraft_client_close",
   "minecraft_client_reload_resources",
   "minecraft_client_hotswap"

@@ -49,6 +49,16 @@ const MAX_WAIT_STEP_MS = 10_000;
 const MAX_SETTLE_TICKS = 40;
 const MAX_CHAT_MESSAGES = 100;
 const MAX_ERROR_BODY_BYTES = 4096;
+// [Arcane Academy fork] Limits for wait_for, the journal and probe queries, and telemetry labels.
+const MAX_WAIT_FOR_MS = 30_000;
+const DEFAULT_WAIT_FOR_MS = 5_000;
+const MIN_WAIT_FOR_INTERVAL_MS = 50;
+const MAX_WAIT_FOR_INTERVAL_MS = 2_000;
+const DEFAULT_WAIT_FOR_INTERVAL_MS = 100;
+const MAX_JOURNAL_READ = 500;
+const CHECK_LABEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,95}$/;
+const PROBE_NAME_PATTERN = /^[a-z0-9_.:-]{1,64}$/;
+const WAIT_FOR_OPERATORS = ["equals", "not_equals", "lt", "gt", "lte", "gte", "matches", "exists", "absent"];
 const DESCRIPTOR_KEYS = [
   "run_id",
   "base_url",
@@ -142,7 +152,16 @@ const tools = [
           description: "File name to save in the evidence folder: letters, digits, dot, underscore, hyphen. .png is added if missing."
         },
         overwrite: { type: "boolean", description: "Replace an existing file of that name. Default false." },
-        include_image: { type: "boolean", description: "Return the image in the reply. Default true." }
+        include_image: { type: "boolean", description: "Return the image in the reply. Default true." },
+        scale: { type: "number", minimum: 0.1, maximum: 1, description: "Downscale factor, for example 0.5 for a quarter of the pixels. Default 1." },
+        region: {
+          type: "object",
+          description: "Crop in GUI-scaled coordinates, like screen widgets: {x, y, w, h}.",
+          properties: { x: { type: "number" }, y: { type: "number" }, w: { type: "number" }, h: { type: "number" } },
+          required: ["x", "y", "w", "h"],
+          additionalProperties: false
+        },
+        check: checkSchema()
       },
       required: ["run_id"],
       additionalProperties: false
@@ -160,9 +179,15 @@ const tools = [
         run_id: { type: "string" },
         kind: {
           type: "string",
-          enum: ["capabilities", "screen", "keymaps", "state", "chat"],
-          description: "View to read. Only state accepts radius; only chat accepts limit. chat returns recent chat lines (newest first) and the action-bar message."
+          enum: ["capabilities", "screen", "keymaps", "state", "chat", "journal", "probe", "particles"],
+          description: "View to read. Only state accepts radius; chat and journal accept limit. chat returns recent chat lines (newest first) and the action-bar message. " +
+            "journal returns client events after the cursor since (chat, action_bar, screen_open/close, sound, bridge_input, and development-mod events), with next to pass as since next time. " +
+            "probe returns a development mod's named JSON probe (name 'list' lists them). particles counts live particles by class."
         },
+        since: { type: "integer", minimum: 0, description: "Journal cursor: the next value of the previous journal read. Default 0." },
+        types: { type: "array", items: { type: "string" }, maxItems: 16, description: "Journal event types to return; others are skipped." },
+        name: { type: "string", description: "Probe name, for kind probe." },
+        check: checkSchema(),
         radius: {
           type: "integer",
           minimum: 1,
@@ -172,8 +197,8 @@ const tools = [
         limit: {
           type: "integer",
           minimum: 1,
-          maximum: 100,
-          description: "Number of chat messages, for kind chat only. Default 20."
+          maximum: 500,
+          description: "Number of chat messages (default 20, max 100) or journal events (default 200, max 500)."
         }
       },
       required: ["run_id", "kind"],
@@ -250,7 +275,8 @@ const tools = [
     description:
       "Run up to 100 steps against one registered client, in order, in one call. A step is any " +
       "minecraft_client_input kind with that kind's fields (no run_id), or {kind:'wait', ms}, " +
-      "{kind:'frame', save_as, overwrite?, include_image?}, {kind:'query', query, radius?, limit?}, {kind:'reload_resources'}, or {kind:'hotswap'}. " +
+      "{kind:'frame', save_as, overwrite?, include_image?, scale?, region?}, {kind:'query', query, radius?, limit?, since?, types?, name?}, " +
+      "{kind:'wait_for', condition, timeout_ms?, interval_ms?}, {kind:'reload_resources'}, or {kind:'hotswap'}. " +
       "Every step is validated before any runs. Identity is rechecked before each step. Stops at the " +
       "first failing step unless continue_on_error is true.",
     inputSchema: {
@@ -270,12 +296,38 @@ const tools = [
           maximum: 40,
           description: "settle_ticks for every input step that does not set its own."
         },
-        continue_on_error: { type: "boolean", description: "Keep going after a failed step. Default false." }
+        continue_on_error: { type: "boolean", description: "Keep going after a failed step. Default false." },
+        check: checkSchema()
       },
       required: ["run_id", "steps"],
       additionalProperties: false
     },
     annotations: { destructiveHint: true, openWorldHint: false }
+  },
+  {
+    // [Arcane Academy fork] Poll fixed read-only views until a condition holds, instead of guessing waits.
+    name: "minecraft_client_wait_for",
+    description:
+      "Wait until a condition holds on one registered client, polling read-only views, then return the value " +
+      "that met it, the elapsed time and the poll count. Fails with the last value seen when timeout_ms passes. " +
+      "condition is one of: {screen: 'none' | class name or part of it}; {chat: regex} (a chat, system or action-bar line " +
+      "after the wait began); {journal: {type, match?}} (an event after the wait began; match is a regex over its data JSON); " +
+      "{entity: type id, within?: 1-32, present?: true|false}; {state: dotted path, op, value?}; {probe: name, path, op, value?}. " +
+      "op is " + WAIT_FOR_OPERATORS.join(", ") + ".",
+    inputSchema: {
+      type: "object",
+      properties: {
+        run_id: { type: "string" },
+        condition: { type: "object", description: "One condition; see the tool description." },
+        timeout_ms: { type: "integer", minimum: 0, maximum: MAX_WAIT_FOR_MS, description: "Default 5000." },
+        interval_ms: { type: "integer", minimum: MIN_WAIT_FOR_INTERVAL_MS, maximum: MAX_WAIT_FOR_INTERVAL_MS, description: "Default 100." },
+        since: { type: "integer", minimum: 0, description: "For chat and journal conditions: a journal cursor to start from, such as one read before the command whose reply you wait for. Default: when the wait begins." },
+        check: checkSchema()
+      },
+      required: ["run_id", "condition"],
+      additionalProperties: false
+    },
+    annotations: { readOnlyHint: true, openWorldHint: false }
   },
   {
     name: "minecraft_client_close",
@@ -325,6 +377,15 @@ process.once("beforeExit", () => {
     void shutdown(0, false);
   }
 });
+
+// [Arcane Academy fork] Every client tool takes an optional check label for run telemetry.
+function checkSchema() {
+  return {
+    type: "string",
+    maxLength: 96,
+    description: "Optional label for this check (for example t056-broom-stow). Each call appends one line to <evidence_root>\\telemetry.jsonl."
+  };
+}
 
 function runIdSchema() {
   return {
@@ -448,12 +509,31 @@ async function callTool(params) {
   if (!isPlainObject(params) || typeof params.name !== "string") {
     throw new Error("tools/call requires a tool name");
   }
-  const args = params.arguments ?? {};
-  if (!isPlainObject(args)) {
+  const rawArgs = params.arguments ?? {};
+  if (!isPlainObject(rawArgs)) {
     throw new Error("Tool arguments must be an object");
   }
+  // [Arcane Academy fork] Strip the telemetry label, run the tool, then record what it cost.
+  const { check, ...args } = rawArgs;
+  if (check !== undefined && (typeof check !== "string" || !CHECK_LABEL_PATTERN.test(check))) {
+    throw new Error("check must be 1-96 letters, digits, dots, underscores, colons or hyphens");
+  }
+  const started = Date.now();
+  let result;
+  let failure;
+  try {
+    result = await dispatchTool(params.name, args);
+    return result;
+  } catch (error) {
+    failure = error;
+    throw error;
+  } finally {
+    await recordTelemetry(params.name, args, check, started, result, failure);
+  }
+}
 
-  switch (params.name) {
+async function dispatchTool(name, args) {
+  switch (name) {
     case "minecraft_client_launch":
       return textResult(await launchClient(args));
     case "minecraft_client_register":
@@ -476,8 +556,10 @@ async function callTool(params) {
       return textResult(await clientLiveOperation(args, "reload_resources"));
     case "minecraft_client_hotswap":
       return textResult(await clientLiveOperation(args, "hotswap"));
+    case "minecraft_client_wait_for":
+      return clientWaitFor(args);
     default:
-      throw new Error(`Unknown tool: ${params.name}`);
+      throw new Error(`Unknown tool: ${name}`);
   }
 }
 
@@ -691,12 +773,12 @@ async function clientStatus(args) {
 }
 
 async function clientFrame(args) {
-  assertAllowedKeys(args, ["run_id", "save_as", "overwrite", "include_image"]);
+  assertAllowedKeys(args, ["run_id", "save_as", "overwrite", "include_image", "scale", "region"]);
   const runId = validateRunId(args.run_id);
   const options = parseFrameOptions(args, true);
   const descriptor = await readDescriptor(runId);
   await revalidateSession(descriptor);
-  const frame = await requestPng(descriptor, "/control/frame");
+  const { bytes: frame, meta } = await requestPng(descriptor, frameEndpoint(options));
   const saved = options.saveAs
     ? await saveEvidenceFrame(descriptor, options.saveAs, options.overwrite, frame)
     : null;
@@ -711,7 +793,8 @@ async function clientFrame(args) {
   content.push({
     type: "text",
     text: `run_id=${descriptor.run_id} process_id=${descriptor.process_id} desktop_name=${descriptor.desktop_name}` +
-      (saved ? ` saved=${saved} bytes=${frame.length}` : "")
+      (saved ? ` saved=${saved} bytes=${frame.length}` : "") +
+      (meta ? ` frame=${JSON.stringify(meta)}` : "")
   });
   return { content, isError: false };
 }
@@ -740,7 +823,43 @@ function parseFrameOptions(args, includeImageDefault) {
   if (!includeImage && !saveAs) {
     throw new Error("A frame needs save_as, include_image true, or both");
   }
-  return { saveAs, overwrite: args.overwrite === true, includeImage };
+  let scale = 1;
+  if (Object.hasOwn(args, "scale")) {
+    if (typeof args.scale !== "number" || !Number.isFinite(args.scale) || args.scale < 0.1 || args.scale > 1) {
+      throw new Error("scale must be a number from 0.1 through 1");
+    }
+    scale = args.scale;
+  }
+  let region = null;
+  if (Object.hasOwn(args, "region")) {
+    if (!isPlainObject(args.region)) {
+      throw new Error("region must be an object {x, y, w, h}");
+    }
+    assertExactKeys(args.region, ["x", "y", "w", "h"]);
+    for (const key of ["x", "y"]) {
+      if (typeof args.region[key] !== "number" || !Number.isFinite(args.region[key]) || args.region[key] < 0) {
+        throw new Error(`region.${key} must be a number of at least 0`);
+      }
+    }
+    for (const key of ["w", "h"]) {
+      if (typeof args.region[key] !== "number" || !Number.isFinite(args.region[key]) || args.region[key] < 1) {
+        throw new Error(`region.${key} must be a number of at least 1`);
+      }
+    }
+    region = { ...args.region };
+  }
+  return { saveAs, overwrite: args.overwrite === true, includeImage, scale, region };
+}
+
+// [Arcane Academy fork] The bridge crops and scales before encoding, so smaller frames cost less to send and read.
+function frameEndpoint(options) {
+  const query = new URLSearchParams();
+  if (options.scale !== 1) query.set("scale", String(options.scale));
+  if (options.region) {
+    for (const key of ["x", "y", "w", "h"]) query.set(key, String(options.region[key]));
+  }
+  const text = query.toString();
+  return text ? `/control/frame?${text}` : "/control/frame";
 }
 
 // Writes only directly inside the registered evidence folder; the name pattern has no separators.
@@ -790,7 +909,7 @@ async function clientSequence(args) {
       throw new Error(`step ${index}: ${error.message}`);
     }
   });
-  const totalWait = plan.reduce((sum, step) => sum + (step.type === "wait" ? step.ms : 0), 0);
+  const totalWait = plan.reduce((sum, step) => sum + (step.type === "wait" ? step.ms : step.type === "wait_for" ? step.timeoutMs : 0), 0);
   if (totalWait > MAX_SEQUENCE_WAIT_MS) {
     throw new Error(`wait steps add up to ${totalWait} ms; the limit is ${MAX_SEQUENCE_WAIT_MS} ms`);
   }
@@ -803,6 +922,13 @@ async function clientSequence(args) {
       if (step.type === "wait") {
         await delay(step.ms);
         results.push({ index, kind: "wait", ok: true, ms: step.ms });
+        continue;
+      }
+      if (step.type === "wait_for") {
+        await revalidateSession(descriptor);
+        const outcome = sanitizeForOutput(await runWaitFor(descriptor, step), descriptor.token);
+        results.push({ index, kind: "wait_for", ok: outcome.met, ...outcome });
+        if (!outcome.met && !continueOnError) break;
         continue;
       }
       const status = await revalidateSession(descriptor);
@@ -820,14 +946,14 @@ async function clientSequence(args) {
         const result = await requestJson(descriptor, "POST", step.endpoint, undefined, 125_000);
         results.push({ index, kind: step.kind, ok: true, result: sanitizeForOutput(result, descriptor.token) });
       } else if (step.type === "frame") {
-        const frame = await requestPng(descriptor, "/control/frame");
+        const { bytes: frame, meta } = await requestPng(descriptor, frameEndpoint(step.options));
         const saved = step.options.saveAs
           ? await saveEvidenceFrame(descriptor, step.options.saveAs, step.options.overwrite, frame)
           : null;
         if (step.options.includeImage) {
           images.push({ type: "image", data: frame.toString("base64"), mimeType: "image/png" });
         }
-        results.push({ index, kind: "frame", ok: true, saved, bytes: frame.length });
+        results.push({ index, kind: "frame", ok: true, saved, bytes: frame.length, ...(meta ? { frame: meta } : {}) });
       } else {
         const result = await requestJson(descriptor, "GET", step.parsed.endpoint, undefined);
         results.push({ index, kind: "query", query: step.parsed.kind, ok: true, result: sanitizeForOutput(result, descriptor.token) });
@@ -850,7 +976,7 @@ async function clientSequence(args) {
     steps: results
   };
   return {
-    content: [{ type: "text", text: JSON.stringify(summary, null, 2) }, ...images],
+    content: [{ type: "text", text: JSON.stringify(summary) }, ...images],
     isError: failed > 0
   };
 }
@@ -875,13 +1001,17 @@ function parseSequenceStep(step, runId, defaultSettle) {
       return { type: "wait", kind: "wait", ms: step.ms };
     }
     case "frame": {
-      assertAllowedKeys(step, ["kind", "save_as", "overwrite", "include_image"]);
+      assertAllowedKeys(step, ["kind", "save_as", "overwrite", "include_image", "scale", "region"]);
       return { type: "frame", kind: "frame", options: parseFrameOptions(step, false) };
+    }
+    case "wait_for": {
+      assertAllowedKeys(step, ["kind", "condition", "timeout_ms", "interval_ms", "since"]);
+      return { type: "wait_for", kind: "wait_for", ...parseWaitFor(step) };
     }
     case "query": {
       const { kind: _kind, query, ...rest } = step;
       if (typeof query !== "string") {
-        throw new Error("query steps need query: capabilities, state, screen, keymaps, or chat");
+        throw new Error("query steps need query: capabilities, state, screen, keymaps, chat, journal, probe, or particles");
       }
       return { type: "query", kind: "query", parsed: parseQuery({ run_id: runId, kind: query, ...rest }) };
     }
@@ -1197,8 +1327,43 @@ function parseQuery(args) {
       }
       return { runId, kind: args.kind, endpoint: `/control/chat?limit=${args.limit}` };
     }
+    case "journal": {
+      // [Arcane Academy fork] Client events after a cursor.
+      assertAllowedKeys(args, ["run_id", "kind", "since", "types", "limit"]);
+      const query = new URLSearchParams();
+      if (Object.hasOwn(args, "since")) {
+        if (!Number.isSafeInteger(args.since) || args.since < 0) throw new Error("journal since must be a non-negative integer");
+        query.set("since", String(args.since));
+      }
+      if (Object.hasOwn(args, "limit")) {
+        if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > MAX_JOURNAL_READ) {
+          throw new Error(`journal limit must be an integer from 1 through ${MAX_JOURNAL_READ}`);
+        }
+        query.set("limit", String(args.limit));
+      }
+      if (Object.hasOwn(args, "types")) {
+        if (!Array.isArray(args.types) || args.types.length > 16 || !args.types.every((type) => typeof type === "string" && /^[a-z0-9_.:-]{1,64}$/.test(type))) {
+          throw new Error("journal types must be up to 16 event type names");
+        }
+        if (args.types.length) query.set("types", args.types.join(","));
+      }
+      const text = query.toString();
+      return { runId, kind: args.kind, endpoint: text ? `/control/journal?${text}` : "/control/journal" };
+    }
+    case "probe": {
+      // [Arcane Academy fork] A development mod's named JSON probe.
+      assertAllowedKeys(args, ["run_id", "kind", "name"]);
+      const name = args.name ?? "list";
+      if (typeof name !== "string" || !PROBE_NAME_PATTERN.test(name)) {
+        throw new Error("probe name must be 1-64 of a-z 0-9 _ . : -");
+      }
+      return { runId, kind: args.kind, endpoint: `/control/probe?name=${encodeURIComponent(name)}` };
+    }
+    case "particles":
+      assertExactKeys(args, ["run_id", "kind"]);
+      return { runId, kind: args.kind, endpoint: "/control/particles" };
     default:
-      throw new Error("query kind must be capabilities, state, screen, keymaps, or chat");
+      throw new Error("query kind must be capabilities, state, screen, keymaps, chat, journal, probe, or particles");
   }
 }
 
@@ -1851,7 +2016,17 @@ async function requestPng(connection, endpoint) {
     if (bytes.length < PNG_SIGNATURE.length || !bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
       throw new Error("Bridge frame response is not a PNG");
     }
-    return bytes;
+    // [Arcane Academy fork] Size, crop and change summary from the bridge; absent on older bridges.
+    let meta = null;
+    const header = pending.response.headers.get("x-mineclient-frame");
+    if (header && header.length <= 4096) {
+      try {
+        meta = JSON.parse(header);
+      } catch {
+        meta = null;
+      }
+    }
+    return { bytes, meta };
   } finally {
     pending.cleanup();
   }
@@ -2223,7 +2398,8 @@ function isPlainObject(value) {
 
 function textResult(value) {
   return {
-    content: [{ type: "text", text: JSON.stringify(value, null, 2) }],
+    // [Arcane Academy fork] Compact JSON: indentation costs agents context on every reply.
+    content: [{ type: "text", text: JSON.stringify(value) }],
     isError: false
   };
 }
@@ -2316,4 +2492,219 @@ async function shutdown(exitCode, forceExit) {
     }
   })();
   return shutdownPromise;
+}
+
+
+// [Arcane Academy fork] wait_for: poll fixed read-only views until a condition holds.
+function parseWaitFor(args) {
+  if (!isPlainObject(args.condition)) {
+    throw new Error("condition must be an object; see minecraft_client_wait_for");
+  }
+  const condition = args.condition;
+  const kinds = ["screen", "chat", "journal", "entity", "state", "probe"].filter((key) => Object.hasOwn(condition, key));
+  if (kinds.length !== 1) {
+    throw new Error("condition needs exactly one of screen, chat, journal, entity, state, probe");
+  }
+  const kind = kinds[0];
+  const allowed = {
+    screen: ["screen"],
+    chat: ["chat"],
+    journal: ["journal"],
+    entity: ["entity", "within", "present"],
+    state: ["state", "op", "value"],
+    probe: ["probe", "path", "op", "value"]
+  }[kind];
+  assertAllowedKeys(condition, allowed);
+  if (kind === "screen" && (typeof condition.screen !== "string" || !condition.screen)) throw new Error("screen must be 'none' or a class name");
+  if (kind === "chat") validatePattern(condition.chat, "chat");
+  if (kind === "journal") {
+    if (!isPlainObject(condition.journal) || typeof condition.journal.type !== "string") throw new Error("journal needs {type, match?}");
+    assertAllowedKeys(condition.journal, ["type", "match"]);
+    if (condition.journal.match !== undefined) validatePattern(condition.journal.match, "journal.match");
+  }
+  if (kind === "entity") {
+    validateBoundedString(condition.entity, "entity", 128);
+    if (condition.within !== undefined && (!Number.isInteger(condition.within) || condition.within < 1 || condition.within > 32)) {
+      throw new Error("within must be an integer from 1 through 32");
+    }
+    if (condition.present !== undefined && typeof condition.present !== "boolean") throw new Error("present must be a boolean");
+  }
+  if (kind === "state" || kind === "probe") {
+    if (kind === "probe" && (typeof condition.probe !== "string" || !PROBE_NAME_PATTERN.test(condition.probe))) {
+      throw new Error("probe must be a probe name");
+    }
+    const pathText = kind === "state" ? condition.state : condition.path;
+    validateBoundedString(pathText, kind === "state" ? "state" : "path", 128);
+    if (!WAIT_FOR_OPERATORS.includes(condition.op)) throw new Error(`op must be one of ${WAIT_FOR_OPERATORS.join(", ")}`);
+    if (!["exists", "absent"].includes(condition.op) && !Object.hasOwn(condition, "value")) throw new Error(`op ${condition.op} needs value`);
+    if (condition.op === "matches") new RegExp(String(condition.value));
+  }
+  const timeoutMs = args.timeout_ms ?? DEFAULT_WAIT_FOR_MS;
+  if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > MAX_WAIT_FOR_MS) {
+    throw new Error(`timeout_ms must be an integer from 0 through ${MAX_WAIT_FOR_MS}`);
+  }
+  const intervalMs = args.interval_ms ?? DEFAULT_WAIT_FOR_INTERVAL_MS;
+  if (!Number.isInteger(intervalMs) || intervalMs < MIN_WAIT_FOR_INTERVAL_MS || intervalMs > MAX_WAIT_FOR_INTERVAL_MS) {
+    throw new Error(`interval_ms must be an integer from ${MIN_WAIT_FOR_INTERVAL_MS} through ${MAX_WAIT_FOR_INTERVAL_MS}`);
+  }
+  let since = null;
+  if (args.since !== undefined) {
+    if (!Number.isSafeInteger(args.since) || args.since < 0) throw new Error("since must be a non-negative integer");
+    since = args.since;
+  }
+  return { condition, conditionKind: kind, timeoutMs, intervalMs, since };
+}
+
+// A regular expression may start or end with a space, unlike other bounded strings.
+function validatePattern(value, label) {
+  if (typeof value !== "string" || value.length < 1 || value.length > 256 || /[\u0000-\u001f\u007f]/.test(value)) {
+    throw new Error(`${label} must be a regular expression of 1-256 characters without control characters`);
+  }
+  try {
+    return new RegExp(value);
+  } catch {
+    throw new Error(`${label} is not a valid regular expression`);
+  }
+}
+
+async function clientWaitFor(args) {
+  assertAllowedKeys(args, ["run_id", "condition", "timeout_ms", "interval_ms", "since"]);
+  const runId = validateRunId(args.run_id);
+  const plan = parseWaitFor(args);
+  const descriptor = await readDescriptor(runId);
+  await revalidateSession(descriptor);
+  const outcome = await runWaitFor(descriptor, plan);
+  return {
+    content: [{ type: "text", text: JSON.stringify(sanitizeForOutput({ run_id: descriptor.run_id, ...outcome }, descriptor.token)) }],
+    isError: !outcome.met
+  };
+}
+
+async function runWaitFor(descriptor, plan) {
+  const started = Date.now();
+  const deadline = started + plan.timeoutMs;
+  let cursor = null;
+  if ((plan.conditionKind === "chat" || plan.conditionKind === "journal") && plan.since !== null) {
+    cursor = plan.since;
+  } else if (plan.conditionKind === "chat" || plan.conditionKind === "journal") {
+    // Only events after the wait began count, so an old matching line cannot satisfy it.
+    const head = await requestJson(descriptor, "GET", "/control/journal?limit=1&since=9000000000000000", undefined);
+    cursor = head.next ?? 0;
+  }
+  let polls = 0;
+  let last;
+  for (;;) {
+    polls++;
+    const observed = await observeCondition(descriptor, plan, cursor);
+    cursor = observed.cursor ?? cursor;
+    last = observed.value;
+    if (observed.met) {
+      return { met: true, condition: plan.condition, value: last, elapsed_ms: Date.now() - started, polls };
+    }
+    if (Date.now() + plan.intervalMs > deadline) {
+      return { met: false, condition: plan.condition, last_value: last, elapsed_ms: Date.now() - started, polls, error: "timed out" };
+    }
+    await delay(plan.intervalMs);
+  }
+}
+
+async function observeCondition(descriptor, plan, cursor) {
+  const condition = plan.condition;
+  switch (plan.conditionKind) {
+    case "screen": {
+      const screen = await requestJson(descriptor, "GET", "/control/screen", undefined);
+      const value = screen.open ? screen.class : "none";
+      const met = condition.screen === "none" ? !screen.open : Boolean(screen.open && String(screen.class).includes(condition.screen));
+      return { met, value: { open: Boolean(screen.open), class: screen.class ?? null, title: screen.title ?? null } };
+    }
+    case "chat":
+    case "journal": {
+      const types = plan.conditionKind === "chat" ? "chat,system_chat,action_bar" : condition.journal.type;
+      const read = await requestJson(descriptor, "GET", `/control/journal?since=${cursor}&limit=${MAX_JOURNAL_READ}&types=${encodeURIComponent(types)}`, undefined);
+      const pattern = plan.conditionKind === "chat" ? new RegExp(condition.chat) : condition.journal.match ? new RegExp(condition.journal.match) : null;
+      for (const event of read.events ?? []) {
+        const subject = plan.conditionKind === "chat" ? String(event.data?.text ?? "") : JSON.stringify(event.data ?? {});
+        if (!pattern || pattern.test(subject)) {
+          return { met: true, value: event, cursor: read.next };
+        }
+      }
+      return { met: false, value: { events_seen: (read.events ?? []).length }, cursor: read.next };
+    }
+    case "entity": {
+      const radius = condition.within ?? 16;
+      const state = await requestJson(descriptor, "GET", `/control/state?radius=${radius}`, undefined);
+      const nearby = state.nearby;
+      const list = Array.isArray(nearby) ? nearby : Array.isArray(nearby?.entities) ? nearby.entities : [];
+      const matches = list.filter((entity) => entity.type === condition.entity);
+      const wantPresent = condition.present !== false;
+      return { met: wantPresent ? matches.length > 0 : matches.length === 0, value: { count: matches.length, first: matches[0] ?? null } };
+    }
+    case "state": {
+      const state = await requestJson(descriptor, "GET", "/control/state", undefined);
+      const value = readPath(state, condition.state);
+      return { met: compareValue(value, condition.op, condition.value), value };
+    }
+    case "probe": {
+      const probe = await requestJson(descriptor, "GET", `/control/probe?name=${encodeURIComponent(condition.probe)}`, undefined);
+      const value = readPath(probe.result?.value ?? probe.result, condition.path);
+      return { met: probe.result?.ok !== false && compareValue(value, condition.op, condition.value), value };
+    }
+    default:
+      throw new Error(`unknown condition ${plan.conditionKind}`);
+  }
+}
+
+// Dotted path with optional array indexes: a.b.0.c. An empty path is the whole value.
+function readPath(value, pathText) {
+  if (!pathText) return value;
+  let current = value;
+  for (const part of pathText.split(".")) {
+    if (current === null || current === undefined) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function compareValue(actual, op, expected) {
+  switch (op) {
+    case "exists": return actual !== undefined && actual !== null;
+    case "absent": return actual === undefined || actual === null;
+    case "equals": return JSON.stringify(actual) === JSON.stringify(expected);
+    case "not_equals": return JSON.stringify(actual) !== JSON.stringify(expected);
+    case "lt": return typeof actual === "number" && actual < expected;
+    case "gt": return typeof actual === "number" && actual > expected;
+    case "lte": return typeof actual === "number" && actual <= expected;
+    case "gte": return typeof actual === "number" && actual >= expected;
+    case "matches": return actual !== undefined && new RegExp(String(expected)).test(typeof actual === "string" ? actual : JSON.stringify(actual));
+    default: return false;
+  }
+}
+
+// [Arcane Academy fork] Run telemetry: one JSON line per tool call in the client's evidence folder,
+// so a handoff can say what each check cost in calls, time, images and reply size. Never fails a call.
+async function recordTelemetry(tool, args, check, started, result, failure) {
+  try {
+    if (typeof args?.run_id !== "string") return;
+    const descriptor = await tryReadDescriptor(args.run_id);
+    if (!descriptor?.evidence_root) return;
+    const content = Array.isArray(result?.content) ? result.content : [];
+    const images = content.filter((block) => block.type === "image");
+    const line = {
+      time: new Date(started).toISOString(),
+      tool: tool.replace(/^minecraft_client_/, ""),
+      run_id: args.run_id,
+      check: check ?? null,
+      duration_ms: Date.now() - started,
+      ok: !failure && result?.isError !== true,
+      steps: Array.isArray(args.steps) ? args.steps.length : undefined,
+      frames: tool === "minecraft_client_frame" ? 1 : Array.isArray(args.steps) ? args.steps.filter((step) => step?.kind === "frame").length : 0,
+      images_returned: images.length,
+      image_bytes: images.reduce((sum, block) => sum + Math.floor(String(block.data ?? "").length * 3 / 4), 0),
+      text_chars: content.filter((block) => block.type === "text").reduce((sum, block) => sum + String(block.text ?? "").length, 0)
+    };
+    await assertNormalDirectory(descriptor.evidence_root);
+    await fs.appendFile(path.win32.join(descriptor.evidence_root, "telemetry.jsonl"), JSON.stringify(line) + "\n");
+  } catch {
+    // Telemetry is advisory; a locked or missing evidence folder must not break the tool.
+  }
 }
